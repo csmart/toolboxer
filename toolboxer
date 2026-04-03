@@ -56,6 +56,7 @@ Usage: $(basename "$0") [--help] <command> [args...]
 
 A restricted replacement for toolbox:
   * Only selected directories are mounted (read-write)
+  * Host integration (X11, Wayland, D-Bus, SSH agent, DNS, etc.) is seamless
   * Uses --userns=keep-id so your UID stays the same inside
 
 Commands:
@@ -206,6 +207,69 @@ build_volume_args() {
     printf '%s\n' "${args[@]}"
 }
 
+build_host_integration_args() {
+    local args=()
+
+    local -a host_configs=(
+        /etc/resolv.conf
+        /etc/hosts
+        /etc/host.conf
+        /etc/hostname
+        /etc/localtime
+        /etc/timezone
+        /etc/machine-id
+    )
+    for f in "${host_configs[@]}"; do
+        [[ -e "$f" ]] && args+=(--volume "$f:$f:ro")
+    done
+
+    if [[ -d /tmp/.X11-unix ]]; then
+        args+=(--volume "/tmp/.X11-unix:/tmp/.X11-unix:ro")
+    fi
+
+    local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [[ -d "$xdg_runtime" ]]; then
+        args+=(--volume "$xdg_runtime:$xdg_runtime")
+    fi
+
+    if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        local dbus_path="${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
+        if [[ "$dbus_path" != "$DBUS_SESSION_BUS_ADDRESS" && -e "$dbus_path" ]]; then
+            args+=(--volume "$dbus_path:$dbus_path")
+        fi
+    fi
+
+    if [[ -n "${SSH_AUTH_SOCK:-}" && -e "$SSH_AUTH_SOCK" ]]; then
+        args+=(--volume "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK")
+    fi
+
+    if [[ -d /run/systemd/journal ]]; then
+        args+=(--volume "/run/systemd/journal:/run/systemd/journal:ro")
+    fi
+
+    if [[ -d /run/udev/data ]]; then
+        args+=(--volume "/run/udev/data:/run/udev/data:ro")
+    fi
+
+    printf '%s\n' "${args[@]}"
+}
+
+build_env_args() {
+    local args=()
+
+    [[ -n "${DISPLAY:-}" ]]                && args+=(--env "DISPLAY=$DISPLAY")
+    [[ -n "${WAYLAND_DISPLAY:-}" ]]        && args+=(--env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && args+=(--env "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+    [[ -n "${SSH_AUTH_SOCK:-}" ]]          && args+=(--env "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+    [[ -n "${TERM:-}" ]]                   && args+=(--env "TERM=$TERM")
+    [[ -n "${LANG:-}" ]]                   && args+=(--env "LANG=$LANG")
+
+    local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    args+=(--env "XDG_RUNTIME_DIR=$xdg_runtime")
+
+    printf '%s\n' "${args[@]}"
+}
+
 default_workdir() {
     read_mount_dirs
     echo "${_MOUNT_ARRAY[0]}"
@@ -314,6 +378,8 @@ case "$cmd" in
         echo "Mounting: ${_MOUNT_ARRAY[*]}"
 
         mapfile -t vol_args < <(build_volume_args)
+        mapfile -t host_args < <(build_host_integration_args)
+        mapfile -t env_args < <(build_env_args)
 
         podman create -it \
             --name "$CONTAINER_NAME" \
@@ -324,6 +390,8 @@ case "$cmd" in
             --ipc host \
             --pid host \
             "${vol_args[@]}" \
+            "${host_args[@]}" \
+            "${env_args[@]}" \
             --workdir "$(default_workdir)" \
             --label "toolbox=true" \
             --label "toolboxer=true" \
