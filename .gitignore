@@ -1,0 +1,14 @@
+# Editors
+*.swp
+*.swo
+*~
+.*.un~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+tests/tmp/
