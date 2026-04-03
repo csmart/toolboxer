@@ -57,6 +57,7 @@ Usage: $(basename "$0") [--help] <command> [args...]
 A restricted replacement for toolbox:
   * Only selected directories are mounted (read-write)
   * Host integration (X11, Wayland, D-Bus, SSH agent, DNS, etc.) is seamless
+  * A matching user with sudo access is created inside the container
   * Uses --userns=keep-id so your UID stays the same inside
 
 Commands:
@@ -275,6 +276,39 @@ default_workdir() {
     echo "${_MOUNT_ARRAY[0]}"
 }
 
+setup_user_in_container() {
+    local cname="$1"
+    local uid gid user_name user_shell user_home
+    uid="$(id -u)"
+    gid="$(id -g)"
+    user_name="$(id -un)"
+    # The host's login shell isn't guaranteed to exist in the container, so
+    # default to bash (always present in toolbox-style images).
+    user_shell="/bin/bash"
+    user_home="$HOME"
+
+    # Create group and user (as root inside the container)
+    podman exec --user root "$cname" bash -c "getent group $gid >/dev/null 2>&1 || groupadd -g $gid $user_name"
+    podman exec --user root "$cname" bash -c "id $user_name >/dev/null 2>&1 || useradd -u $uid -g $gid -d $user_home -s $user_shell -M $user_name" 2>/dev/null || true
+
+    # Ensure sudo is installed — Fedora/RHEL toolbox images ship it, but the
+    # generic ubuntu/arch images we support via --distro don't.
+    podman exec --user root "$cname" bash -c '
+        if command -v sudo >/dev/null 2>&1; then exit 0; fi
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y sudo >/dev/null 2>&1
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y sudo >/dev/null 2>&1
+        elif command -v pacman >/dev/null 2>&1; then
+            pacman -Sy --noconfirm sudo >/dev/null 2>&1
+        fi
+    ' || true
+
+    # Grant passwordless sudo
+    podman exec --user root "$cname" mkdir -p /etc/sudoers.d
+    podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
+}
+
 ensure_exists() {
     podman container exists "$CONTAINER_NAME"
 }
@@ -289,6 +323,14 @@ ensure_started() {
 
     # Container is created/stopped — start it
     podman start "$CONTAINER_NAME" >/dev/null 2>&1
+
+    # Run user setup on first start (check if sudoers file exists)
+    local user_name
+    user_name="$(id -un)"
+    if ! podman exec --user root "$CONTAINER_NAME" test -f "/etc/sudoers.d/$user_name" 2>/dev/null; then
+        echo "Setting up user environment..."
+        setup_user_in_container "$CONTAINER_NAME"
+    fi
 }
 
 # Find the default container: use CONTAINER_NAME if set/exists, otherwise
