@@ -25,6 +25,9 @@ resolve_image() {
     local release="${2:-$HOST_VERSION_ID}"
     case "$distro" in
         fedora) echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
+        rhel)   echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}" ;;
+        ubuntu) echo "docker.io/library/ubuntu:${release}" ;;
+        arch)   echo "docker.io/library/archlinux:latest" ;;
         *)      echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
     esac
 }
@@ -89,6 +92,7 @@ Usage: $(basename "$0") create [options] [CONTAINER]
 Create a new toolboxer container.
 
 Options:
+  -d, --distro DISTRO   Use a different distro (default: host distro)
   -i, --image NAME      Use a custom image (incompatible with --distro/--release)
   -r, --release RELEASE Use a different release (default: host release)
   -m, --mount DIR       Directory to mount (repeatable; default: $DEFAULT_MOUNT_DIRS)
@@ -105,6 +109,7 @@ Enter a toolboxer container. If no container is specified, the default is used.
 If no container exists, offers to create one.
 
 Options:
+  -d, --distro DISTRO   Enter container for a different distro
   -r, --release RELEASE Enter container for a different release
   -h, --help            Show this help
 EOF
@@ -119,6 +124,7 @@ Run a command inside a toolboxer container.
 
 Options:
   -c, --container NAME  Run in a specific container
+  -d, --distro DISTRO   Run in container for a different distro
   -r, --release RELEASE Run in container for a different release
   -h, --help            Show this help
 EOF
@@ -383,6 +389,7 @@ case "$cmd" in
         # Parse create-specific flags
         while [[ $# -gt 0 ]]; do
             case "$1" in
+                -d|--distro)  DISTRO="$2";  shift 2 ;;
                 -i|--image)   IMAGE="$2";   shift 2 ;;
                 -r|--release) RELEASE="$2"; shift 2 ;;
                 -m|--mount)   cli_mounts+=("$2"); shift 2 ;;
@@ -448,6 +455,7 @@ case "$cmd" in
         # Parse enter-specific flags
         while [[ $# -gt 0 ]]; do
             case "$1" in
+                -d|--distro)  DISTRO="$2";  shift 2 ;;
                 -r|--release) RELEASE="$2"; shift 2 ;;
                 -h|--help)    usage_enter 0 ;;
                 -*)           echo "Unknown enter option: $1"; usage_enter ;;
@@ -467,6 +475,7 @@ case "$cmd" in
                     reinvoke_args+=(-m "$d")
                 done
                 reinvoke_args+=(create)
+                [[ -n "$DISTRO" ]] && reinvoke_args+=(--distro "$DISTRO")
                 [[ -n "$RELEASE" ]] && reinvoke_args+=(--release "$RELEASE")
                 reinvoke_args+=("$CONTAINER_NAME")
                 "$0" "${reinvoke_args[@]}"
@@ -488,6 +497,7 @@ case "$cmd" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -c|--container) CONTAINER_NAME="$2"; shift 2 ;;
+                -d|--distro)    DISTRO="$2";         shift 2 ;;
                 -r|--release)   RELEASE="$2";        shift 2 ;;
                 -h|--help)      usage_run 0 ;;
                 --)             shift; break ;;
