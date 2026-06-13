@@ -25,9 +25,10 @@ DEFAULT_MOUNT_DIRS="${HOME}/code"
 #
 # Known distros map to their official toolbox/base image at the host's release.
 # A distro we don't recognise directly is mapped to a base via its os-release
-# ID_LIKE (resolve_image_from_like) — derivatives such as Mint, Pop!_OS or
-# Manjaro go to their parent — and anything still unrecognised falls back to
-# Fedora's toolbox image.
+# ID_LIKE (resolve_image_from_like): derivatives such as Mint/Pop!_OS/Manjaro
+# go to their parent, and any RHEL-family clone (Rocky, AlmaLinux, Oracle, …)
+# defaults to Rocky Linux — a binary-compatible image, unlike Fedora. Anything
+# still unrecognised falls back to Fedora's toolbox image.
 resolve_image() {
     local distro="${1:-$HOST_ID}"
     local release="${2:-$HOST_VERSION_ID}"
@@ -35,27 +36,32 @@ resolve_image() {
         fedora)              echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
         rhel)                echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}" ;;
         centos)              echo "quay.io/centos/centos:stream${release%%.*}" ;;
+        rocky)               echo "docker.io/library/rockylinux:${release%%.*}" ;;
         ubuntu)              echo "docker.io/library/ubuntu:${release}" ;;
         debian)              echo "docker.io/library/debian:${release%%.*}" ;;
         arch)                echo "docker.io/library/archlinux:latest" ;;
         opensuse-leap)       echo "registry.opensuse.org/opensuse/leap:${release}" ;;
         opensuse-tumbleweed) echo "registry.opensuse.org/opensuse/tumbleweed:latest" ;;
-        *)                   resolve_image_from_like ;;
+        *)                   resolve_image_from_like "$release" ;;
     esac
 }
 
-# Map a distro we don't handle directly to a base image via its os-release
-# ID_LIKE. Derivative versions rarely match the base's tags, so the base is
-# pulled at :latest; an empty or unrecognised ID_LIKE falls back to Fedora.
+# Map a distro we don't handle directly to a base image via os-release ID_LIKE.
+# Non-RHEL derivative versions rarely line up with the base's tags, so those are
+# pulled at :latest; RHEL-family clones share RHEL's major versioning, so they
+# map to Rocky Linux at the host's major version. Falls back to Fedora's toolbox
+# image when ID_LIKE is empty or names nothing we recognise.
 resolve_image_from_like() {
+    local release="${1:-latest}"
     local like
     for like in $HOST_ID_LIKE; do
         case "$like" in
-            ubuntu)             echo "docker.io/library/ubuntu:latest";                  return ;;
-            debian)             echo "docker.io/library/debian:latest";                  return ;;
-            arch)               echo "docker.io/library/archlinux:latest";               return ;;
-            suse|opensuse)      echo "registry.opensuse.org/opensuse/tumbleweed:latest"; return ;;
-            fedora|rhel|centos) echo "registry.fedoraproject.org/fedora-toolbox:latest"; return ;;
+            ubuntu)        echo "docker.io/library/ubuntu:latest";                  return ;;
+            debian)        echo "docker.io/library/debian:latest";                  return ;;
+            arch)          echo "docker.io/library/archlinux:latest";               return ;;
+            suse|opensuse) echo "registry.opensuse.org/opensuse/tumbleweed:latest"; return ;;
+            rhel|centos)   echo "docker.io/library/rockylinux:${release%%.*}";      return ;;
+            fedora)        echo "registry.fedoraproject.org/fedora-toolbox:latest"; return ;;
         esac
     done
     echo "registry.fedoraproject.org/fedora-toolbox:latest"
@@ -158,7 +164,7 @@ Create a new toolboxer container. If CONTAINER is omitted, the name is derived
 from the distro and release (e.g. ${HOST_ID}-toolbox-${HOST_VERSION_ID}).
 
 Options:
-  -d, --distro DISTRO   Base distro: fedora, rhel, centos, ubuntu, debian,
+  -d, --distro DISTRO   Base distro: fedora, rhel, centos, rocky, ubuntu, debian,
                         arch, opensuse-leap, opensuse-tumbleweed
                         (default: host distro, $HOST_ID; incompatible with --image)
   -r, --release RELEASE Distro release/version
@@ -193,7 +199,7 @@ option before 'enter' (e.g. '$prog -m ~/code enter').
 
 Options:
   -d, --distro DISTRO   Enter the container for a different distro
-                        (fedora, rhel, centos, ubuntu, debian, arch, opensuse-*)
+                        (fedora, rhel, centos, rocky, ubuntu, debian, arch, opensuse-*)
   -r, --release RELEASE Enter the container for a different release
   -h, --help            Show this help
 
@@ -218,7 +224,7 @@ otherwise be mistaken for run's own options.
 Options:
   -c, --container NAME  Run in a specific container (default: the resolved container)
   -d, --distro DISTRO   Run in the container for a different distro
-                        (fedora, rhel, centos, ubuntu, debian, arch, opensuse-*)
+                        (fedora, rhel, centos, rocky, ubuntu, debian, arch, opensuse-*)
   -r, --release RELEASE Run in the container for a different release
   -h, --help            Show this help
 
