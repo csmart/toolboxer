@@ -7,7 +7,7 @@ _toolboxer() {
     _init_completion || return
 
     local commands="create enter run list stop rm rmi help"
-    local global_opts="-m --mount -A --ai-agents -h --help"
+    local global_opts="-m --mount -A --ai-agents -y --assumeyes -h --help"
 
     # Find the subcommand position (skip global options and their arguments)
     local cmd_idx cmd=""
@@ -64,9 +64,13 @@ _toolboxer() {
                     _filedir -d
                     return
                     ;;
+                --authfile)
+                    _filedir
+                    return
+                    ;;
             esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -A --ai-agents -h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -A --ai-agents --authfile -h --help" -- "$cur"))
             fi
             ;;
         enter)
@@ -98,9 +102,10 @@ _toolboxer() {
                     return
                     ;;
                 -r|--release) return ;;
+                --preserve-fds) return ;;
             esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-c --container -d --distro -r --release -h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-c --container -d --distro -r --release --preserve-fds -h --help" -- "$cur"))
             else
                 COMPREPLY=($(compgen -c -- "$cur"))
             fi

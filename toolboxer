@@ -83,6 +83,8 @@ IMAGE="${IMAGE:-}"
 # These will be set after flag parsing
 DISTRO=""
 RELEASE=""
+AUTHFILE=""
+PRESERVE_FDS=""
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -122,6 +124,7 @@ Global options (must come before the command):
   -A, --ai-agents         Also mount the config of any AI agent CLIs found in
                           your home (Claude Code, Codex, Gemini, Aider, …) so
                           they run inside the container with your host login.
+  -y, --assumeyes         Assume yes to prompts (e.g. auto-create on 'enter').
   -h, --help              Show this help
 
 Each command has its own options too — see '$prog <command> --help'.
@@ -174,6 +177,7 @@ Options:
   -r, --release RELEASE Distro release/version
                         (default: host release, $HOST_VERSION_ID; incompatible with --image)
   -i, --image NAME      Use a custom image (incompatible with --distro/--release)
+      --authfile FILE   Registry credentials file for pulling the image
   -m, --mount DIR       Mount DIR (read-write); repeat once per directory.
                         Replaces the default mount ($DEFAULT_MOUNT_DIRS).
                         The first mounted directory becomes the working directory.
@@ -237,6 +241,7 @@ Options:
   -d, --distro DISTRO   Run in the container for a different distro
                         (fedora, rhel, centos, rocky, ubuntu, debian, arch, opensuse-*)
   -r, --release RELEASE Run in the container for a different release
+      --preserve-fds N  Pass down N extra inherited file descriptors
   -h, --help            Show this help
 
 Examples:
@@ -345,11 +350,13 @@ EOF
 
 cli_mounts=()
 copy_ai_agents=false
+assume_yes=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -m|--mount)     cli_mounts+=("$2");  shift 2 ;;
         -A|--ai-agents) copy_ai_agents=true; shift ;;
+        -y|--assumeyes) assume_yes=true;     shift ;;
         -h|--help)      usage 0 ;;
         -*)             echo "Unknown option: $1"; usage ;;
         *)              break ;;
@@ -677,6 +684,7 @@ case "$cmd" in
                 -r|--release) RELEASE="$2"; shift 2 ;;
                 -m|--mount)   cli_mounts+=("$2"); shift 2 ;;
                 -A|--ai-agents) copy_ai_agents=true; shift ;;
+                --authfile)   AUTHFILE="$2"; shift 2 ;;
                 -h|--help)    usage_create 0 ;;
                 -*)           echo "Unknown create option: $1"; usage_create ;;
                 *)            CONTAINER_NAME="$1"; shift ;;
@@ -726,6 +734,10 @@ case "$cmd" in
             fi
         fi
 
+        # --authfile (toolbox-compatible): credentials for pulling the image.
+        authfile_args=()
+        [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
+
         # --privileged: in *rootless* podman this grants no real host privilege
         # (the container is still confined to your rootless user namespace) — it
         # just hands the container the capabilities you already have and unmasks
@@ -748,6 +760,7 @@ case "$cmd" in
             "${env_args[@]}" \
             "${device_args[@]}" \
             "${agent_args[@]}" \
+            "${authfile_args[@]}" \
             --workdir "$(default_workdir)" \
             --label "toolbox=true" \
             --label "toolboxer=true" \
@@ -774,7 +787,11 @@ case "$cmd" in
 
         if ! resolve_container; then
             echo "No toolboxer container found."
-            read -rp "Create container '$CONTAINER_NAME' now? [y/N] " answer
+            if [[ "$assume_yes" == true ]]; then
+                answer="y"
+            else
+                read -rp "Create container '$CONTAINER_NAME' now? [y/N] " answer
+            fi
             if [[ "$answer" =~ ^[Yy] ]]; then
                 # Build the re-invocation as an array so paths with spaces survive.
                 reinvoke_args=()
@@ -807,6 +824,7 @@ case "$cmd" in
                 -c|--container) CONTAINER_NAME="$2"; shift 2 ;;
                 -d|--distro)    DISTRO="$2";         shift 2 ;;
                 -r|--release)   RELEASE="$2";        shift 2 ;;
+                --preserve-fds) PRESERVE_FDS="$2";   shift 2 ;;
                 -h|--help)      usage_run 0 ;;
                 --)             shift; break ;;
                 *)              break ;;
@@ -827,9 +845,13 @@ case "$cmd" in
             exit 1
         fi
         ensure_started
+        # --preserve-fds (toolbox-compatible): pass N extra inherited fds through.
+        pfds_args=()
+        [[ -n "$PRESERVE_FDS" ]] && pfds_args=(--preserve-fds "$PRESERVE_FDS")
         podman exec -it \
             --user "$(id -u):$(id -g)" \
             --workdir "$(default_workdir)" \
+            "${pfds_args[@]}" \
             "$CONTAINER_NAME" \
             "$@"
         ;;

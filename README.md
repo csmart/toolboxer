@@ -11,7 +11,7 @@ A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/
 - **Nested podman** — rootless podman-in-podman works out of the box, with no required host devices (see [Running podman inside the container](#running-podman-inside-the-container)).
 - **AI agents** — `--ai-agents` shares the config of AI agent CLIs (Claude Code, Codex, Gemini, Aider, …) from your home into the container so they run with your existing login.
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
-- **toolbox-compatible CLI** — commands and flags match `toolbox` (`create`, `enter`, `run`, `list`, `rm`, `rmi`) with the same `-d`/`-r`/`-i`/`-c` flags.
+- **toolbox-compatible CLI** — implements every user-facing `toolbox` command (`create`, `enter`, `run`, `list`, `rm`, `rmi`, `help`) and their flags, so existing `toolbox` invocations work unchanged (see [Compatibility with toolbox](#compatibility-with-toolbox)).
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
 - **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically.
 
@@ -348,6 +348,39 @@ CLI tests run without Podman. Integration tests (create, run, sudo, rm) require 
 shellcheck toolboxer
 ```
 
+## Compatibility with toolbox
+
+toolboxer aims to be a drop-in replacement: every **user-facing** `toolbox`
+command and flag is implemented, so existing invocations and muscle memory work
+unchanged. It also adds extras of its own.
+
+### Commands
+
+| `toolbox` | `toolboxer` | Notes |
+|-----------|:---------:|-------|
+| `create` | ✅ | plus `-m/--mount`, `-A/--ai-agents` |
+| `enter` | ✅ | |
+| `run` | ✅ | |
+| `list` | ✅ | |
+| `rm` | ✅ | plus `-d/--distro`, `-r/--release` |
+| `rmi` | ✅ | |
+| `help` | ✅ | |
+| `init-container` | n/a | Internal `toolbox` container entrypoint, never run by users; toolboxer sets the user up via `useradd`/sudoers on first start instead. |
+| — | `stop` | toolboxer extra |
+
+### Flags
+
+All `toolbox` per-command flags are implemented — `create` (`-d`/`-i`/`-r`/`--authfile`),
+`enter` (`-d`/`-r`), `run` (`-c`/`-d`/`-r`/`--preserve-fds`), `list` (`-c`/`-i`),
+`rm` (`-a`/`-f`), `rmi` (`-a`/`-f`) — plus the globals `-y`/`--assumeyes` and `-h`/`--help`.
+
+**Not implemented:** the debugging/logging globals `-v`/`--verbose`, `--log-level`,
+and `--log-podman`. toolboxer is a Bash script, so run it with `bash -x` for
+tracing instead.
+
+**toolboxer extras:** global `-m`/`--mount` and `-A`/`--ai-agents`; `-d`/`-r` on
+`rm` and `stop`; and the `stop` command.
+
 ## How it differs from toolbox
 
 | | `toolbox` | `toolboxer` |
@@ -355,8 +388,6 @@ shellcheck toolboxer
 | Home directory | Entire `$HOME` mounted | Only specified directories mounted |
 | Host integration | Full | Full (X11, Wayland, D-Bus, SSH, DNS, etc.) |
 | User setup | Via init-container | Via `useradd` + sudoers on first `enter`/`run` |
-| Extra global option | — | `-m/--mount` for restricted volume control |
-| Extra command | — | `stop` |
 | Implementation | Go binary | Single Bash script |
 | Container label | `com.github.containers.toolbox` | `toolbox=true` + `toolboxer=true` |
 
