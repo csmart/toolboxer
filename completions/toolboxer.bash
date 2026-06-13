@@ -48,7 +48,7 @@ _toolboxer() {
         create)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel ubuntu arch" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
                     return
                     ;;
                 -i|--image)
@@ -72,7 +72,7 @@ _toolboxer() {
         enter)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel ubuntu arch" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;
@@ -94,7 +94,7 @@ _toolboxer() {
                     return
                     ;;
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel ubuntu arch" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;

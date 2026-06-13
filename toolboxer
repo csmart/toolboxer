@@ -7,29 +7,58 @@ set -euo pipefail
 # Defaults
 # ---------------------------------------------------------------------------
 
-# Detect host distro and version for the default image.
+# Detect host distro and version for the default image. ID_LIKE lets us map
+# derivatives (Mint, Pop!_OS, Manjaro, …) onto their base distro's image.
+HOST_ID="fedora"
+HOST_VERSION_ID="latest"
+HOST_ID_LIKE=""
 if [[ -f /etc/os-release ]]; then
     source /etc/os-release
     HOST_ID="${ID:-fedora}"
     HOST_VERSION_ID="${VERSION_ID:-latest}"
-else
-    HOST_ID="fedora"
-    HOST_VERSION_ID="latest"
+    HOST_ID_LIKE="${ID_LIKE:-}"
 fi
 
 DEFAULT_MOUNT_DIRS="${HOME}/code"
 
-# Resolve the image from distro + release
+# Resolve the container image from distro + release.
+#
+# Known distros map to their official toolbox/base image at the host's release.
+# A distro we don't recognise directly is mapped to a base via its os-release
+# ID_LIKE (resolve_image_from_like) — derivatives such as Mint, Pop!_OS or
+# Manjaro go to their parent — and anything still unrecognised falls back to
+# Fedora's toolbox image.
 resolve_image() {
     local distro="${1:-$HOST_ID}"
     local release="${2:-$HOST_VERSION_ID}"
     case "$distro" in
-        fedora) echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
-        rhel)   echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}" ;;
-        ubuntu) echo "docker.io/library/ubuntu:${release}" ;;
-        arch)   echo "docker.io/library/archlinux:latest" ;;
-        *)      echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
+        fedora)              echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
+        rhel)                echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}" ;;
+        centos)              echo "quay.io/centos/centos:stream${release%%.*}" ;;
+        ubuntu)              echo "docker.io/library/ubuntu:${release}" ;;
+        debian)              echo "docker.io/library/debian:${release%%.*}" ;;
+        arch)                echo "docker.io/library/archlinux:latest" ;;
+        opensuse-leap)       echo "registry.opensuse.org/opensuse/leap:${release}" ;;
+        opensuse-tumbleweed) echo "registry.opensuse.org/opensuse/tumbleweed:latest" ;;
+        *)                   resolve_image_from_like ;;
     esac
+}
+
+# Map a distro we don't handle directly to a base image via its os-release
+# ID_LIKE. Derivative versions rarely match the base's tags, so the base is
+# pulled at :latest; an empty or unrecognised ID_LIKE falls back to Fedora.
+resolve_image_from_like() {
+    local like
+    for like in $HOST_ID_LIKE; do
+        case "$like" in
+            ubuntu)             echo "docker.io/library/ubuntu:latest";                  return ;;
+            debian)             echo "docker.io/library/debian:latest";                  return ;;
+            arch)               echo "docker.io/library/archlinux:latest";               return ;;
+            suse|opensuse)      echo "registry.opensuse.org/opensuse/tumbleweed:latest"; return ;;
+            fedora|rhel|centos) echo "registry.fedoraproject.org/fedora-toolbox:latest"; return ;;
+        esac
+    done
+    echo "registry.fedoraproject.org/fedora-toolbox:latest"
 }
 
 # Resolve the default container name from distro + release
@@ -129,7 +158,8 @@ Create a new toolboxer container. If CONTAINER is omitted, the name is derived
 from the distro and release (e.g. ${HOST_ID}-toolbox-${HOST_VERSION_ID}).
 
 Options:
-  -d, --distro DISTRO   Base distro: fedora, rhel, ubuntu, arch
+  -d, --distro DISTRO   Base distro: fedora, rhel, centos, ubuntu, debian,
+                        arch, opensuse-leap, opensuse-tumbleweed
                         (default: host distro, $HOST_ID; incompatible with --image)
   -r, --release RELEASE Distro release/version
                         (default: host release, $HOST_VERSION_ID; incompatible with --image)
@@ -163,7 +193,7 @@ option before 'enter' (e.g. '$prog -m ~/code enter').
 
 Options:
   -d, --distro DISTRO   Enter the container for a different distro
-                        (fedora, rhel, ubuntu, arch)
+                        (fedora, rhel, centos, ubuntu, debian, arch, opensuse-*)
   -r, --release RELEASE Enter the container for a different release
   -h, --help            Show this help
 
@@ -188,7 +218,7 @@ otherwise be mistaken for run's own options.
 Options:
   -c, --container NAME  Run in a specific container (default: the resolved container)
   -d, --distro DISTRO   Run in the container for a different distro
-                        (fedora, rhel, ubuntu, arch)
+                        (fedora, rhel, centos, ubuntu, debian, arch, opensuse-*)
   -r, --release RELEASE Run in the container for a different release
   -h, --help            Show this help
 

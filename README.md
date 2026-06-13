@@ -10,7 +10,7 @@ A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
 - **toolbox-compatible CLI** — commands and flags match `toolbox` (`create`, `enter`, `run`, `list`, `rm`, `rmi`) with the same `-d`/`-r`/`-i`/`-c` flags.
-- **Multi-distro** — supports Fedora, RHEL, Ubuntu, and Arch images via `--distro`/`--release`.
+- **Multi-distro** — supports Fedora, RHEL, CentOS, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and derivatives (Mint, Pop!_OS, Manjaro, …) are mapped to their base via `ID_LIKE`.
 - **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically.
 
 ## Requirements
