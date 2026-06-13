@@ -54,121 +54,231 @@ RELEASE=""
 # ---------------------------------------------------------------------------
 
 usage() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") [--help] <command> [args...]
+toolboxer — a restricted, drop-in replacement for toolbox.
 
-A restricted replacement for toolbox:
+Usage: $prog [global options] <command> [command options] [args...]
+
+Creates Podman development containers that mount only the directories you
+choose, instead of your entire home directory:
   * Only selected directories are mounted (read-write)
   * Host integration (X11, Wayland, D-Bus, SSH agent, DNS, etc.) is seamless
-  * A matching user with sudo access is created inside the container
-  * Uses --userns=keep-id so your UID stays the same inside
+  * A matching user with passwordless sudo is created inside the container
+  * Uses --userns=keep-id so your UID/GID stay the same inside
+
+Running '$prog' with no command defaults to 'enter'.
 
 Commands:
-  create          Create the container
-  enter           Enter the container (starts it if stopped)
-  run <cmd>       Run a single command inside the container
-  list            Show all toolboxer containers and/or images
-  stop            Stop the container
-  rm              Remove the container(s)
-  rmi             Remove toolboxer image(s)
-  help            Show this help
+  create [CONTAINER]      Create the container
+  enter  [CONTAINER]      Enter the container (starts it if stopped, offers to create)
+  run <cmd> [args...]     Run a single command inside the container
+  list                    List toolboxer containers and/or images
+  stop   [CONTAINER]      Stop the container
+  rm     [CONTAINER...]   Remove the container(s)
+  rmi    <IMAGE...>       Remove toolboxer image(s)
+  help                    Show this help
 
-Global options:
-  -h, --help            Show this help
-  -m, --mount DIR       Directory to mount (repeatable; default: $DEFAULT_MOUNT_DIRS)
+Global options (must come before the command):
+  -m, --mount DIR         Mount DIR (read-write) into the container. Repeat the
+                          flag once per directory. This replaces the default
+                          mount ($DEFAULT_MOUNT_DIRS) rather than adding to it.
+  -h, --help              Show this help
 
-See '$(basename "$0") <command> --help' for command-specific options.
+Each command has its own options too — see '$prog <command> --help'.
+
+Mounting additional directories:
+  By default only $DEFAULT_MOUNT_DIRS is mounted. Pass -m/--mount once per
+  directory you want available inside the container (the first one becomes the
+  working directory on 'enter'):
+
+    $prog -m ~/code -m ~/documents create
+    $prog create -m ~/code -m ~/work/project   # 'create' accepts -m directly too
+
+  Or set MOUNT_DIRS to a colon-separated list (CLI flags override it):
+
+    MOUNT_DIRS=~/code:~/documents $prog create
 
 Environment variables (lowest priority — CLI flags override these):
-  CONTAINER_NAME, IMAGE, MOUNT_DIRS (colon-separated list)
+  CONTAINER_NAME          Default container name
+  IMAGE                   Image to use (e.g. fedora:41)
+  MOUNT_DIRS              Colon-separated list of directories to mount
+
+Examples:
+  $prog                                # enter the default container
+  $prog create                         # create the default container
+  $prog -m ~/code -m ~/docs create     # create, mounting two directories
+  $prog create --distro ubuntu --release 24.04
+  $prog create --image fedora:41 my-project
+  $prog enter my-project               # enter a named container
+  $prog run make test                  # run a command in the container
+  $prog list --containers              # list only containers
+  $prog rm --all --force               # remove every toolboxer container
 EOF
     exit "${1:-1}"
 }
 
 usage_create() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") create [options] [CONTAINER]
+Usage: $prog create [options] [CONTAINER]
 
-Create a new toolboxer container.
+Create a new toolboxer container. If CONTAINER is omitted, the name is derived
+from the distro and release (e.g. ${HOST_ID}-toolbox-${HOST_VERSION_ID}).
 
 Options:
-  -d, --distro DISTRO   Use a different distro (default: host distro)
+  -d, --distro DISTRO   Base distro: fedora, rhel, ubuntu, arch
+                        (default: host distro, $HOST_ID; incompatible with --image)
+  -r, --release RELEASE Distro release/version
+                        (default: host release, $HOST_VERSION_ID; incompatible with --image)
   -i, --image NAME      Use a custom image (incompatible with --distro/--release)
-  -r, --release RELEASE Use a different release (default: host release)
-  -m, --mount DIR       Directory to mount (repeatable; default: $DEFAULT_MOUNT_DIRS)
+  -m, --mount DIR       Mount DIR (read-write); repeat once per directory.
+                        Replaces the default mount ($DEFAULT_MOUNT_DIRS).
+                        The first mounted directory becomes the working directory.
   -h, --help            Show this help
+
+Examples:
+  $prog create
+  $prog create -m ~/code -m ~/documents
+  $prog create --distro ubuntu --release 24.04 ubuntu-dev
+  $prog create --image fedora:41
 EOF
     exit "${1:-1}"
 }
 
 usage_enter() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") enter [options] [CONTAINER]
+Usage: $prog enter [options] [CONTAINER]
 
-Enter a toolboxer container. If no container is specified, the default is used.
-If no container exists, offers to create one.
+Enter a toolboxer container, starting it if stopped. If no container is named,
+the default is used; if exactly one toolboxer container exists, it is chosen
+automatically. If none exist, you are offered the chance to create one.
+
+To mount extra directories when creating on demand, pass -m/--mount as a global
+option before 'enter' (e.g. '$prog -m ~/code enter').
 
 Options:
-  -d, --distro DISTRO   Enter container for a different distro
-  -r, --release RELEASE Enter container for a different release
+  -d, --distro DISTRO   Enter the container for a different distro
+                        (fedora, rhel, ubuntu, arch)
+  -r, --release RELEASE Enter the container for a different release
   -h, --help            Show this help
+
+Examples:
+  $prog enter
+  $prog enter my-project
+  $prog enter --distro ubuntu --release 24.04
 EOF
     exit "${1:-1}"
 }
 
 usage_run() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") run [options] [COMMAND [ARGS...]]
+Usage: $prog run [options] [--] COMMAND [ARGS...]
 
-Run a command inside a toolboxer container.
+Run a single command inside a toolboxer container, then exit. The container is
+started first if it is stopped. Use '--' before COMMAND if its arguments would
+otherwise be mistaken for run's own options.
 
 Options:
-  -c, --container NAME  Run in a specific container
-  -d, --distro DISTRO   Run in container for a different distro
-  -r, --release RELEASE Run in container for a different release
+  -c, --container NAME  Run in a specific container (default: the resolved container)
+  -d, --distro DISTRO   Run in the container for a different distro
+                        (fedora, rhel, ubuntu, arch)
+  -r, --release RELEASE Run in the container for a different release
   -h, --help            Show this help
+
+Examples:
+  $prog run make test
+  $prog run --container my-project gcc -o hello hello.c
+  $prog run -- ls -la
 EOF
     exit "${1:-1}"
 }
 
 usage_list() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") list [options]
+Usage: $prog list [options]
 
-List toolboxer containers and images.
+List toolboxer containers and images. With no options, both are shown.
 
 Options:
   -c, --containers      Show only containers
   -i, --images          Show only images
   -h, --help            Show this help
+
+Examples:
+  $prog list
+  $prog list --containers
+  $prog list --images
 EOF
     exit "${1:-1}"
 }
 
 usage_rm() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") rm [options] [CONTAINER...]
+Usage: $prog rm [options] [CONTAINER...]
 
-Remove one or more toolboxer containers.
+Remove one or more toolboxer containers. With no names and no --all, the
+default container is removed. Running containers need --force.
 
 Options:
   -a, --all             Remove all toolboxer containers
   -f, --force           Force removal of running containers
   -h, --help            Show this help
+
+Examples:
+  $prog rm
+  $prog rm my-project another-project
+  $prog rm --all --force
 EOF
     exit "${1:-1}"
 }
 
 usage_rmi() {
+    local prog
+    prog="$(basename "$0")"
     cat <<EOF
-Usage: $(basename "$0") rmi [options] [IMAGE...]
+Usage: $prog rmi [options] <IMAGE...>
 
-Remove one or more toolbox images.
+Remove one or more toolbox images. Specify image name(s) or use --all.
 
 Options:
   -a, --all             Remove all toolbox images
   -f, --force           Force removal (removes dependent containers too)
   -h, --help            Show this help
+
+Examples:
+  $prog rmi fedora-toolbox:41
+  $prog rmi --all
+  $prog rmi --all --force
+EOF
+    exit "${1:-1}"
+}
+
+usage_stop() {
+    local prog
+    prog="$(basename "$0")"
+    cat <<EOF
+Usage: $prog stop [CONTAINER]
+
+Stop a running toolboxer container. If no container is named, the default
+(or the single existing toolboxer container) is stopped.
+
+Options:
+  -h, --help            Show this help
+
+Examples:
+  $prog stop
+  $prog stop my-project
 EOF
     exit "${1:-1}"
 }
@@ -561,8 +671,8 @@ case "$cmd" in
         # Parse positional container name
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -h|--help) echo "Usage: $(basename "$0") stop [CONTAINER]"; exit 0 ;;
-                -*)        echo "Unknown stop option: $1"; exit 1 ;;
+                -h|--help) usage_stop 0 ;;
+                -*)        echo "Unknown stop option: $1"; usage_stop ;;
                 *)         CONTAINER_NAME="$1"; shift ;;
             esac
         done
