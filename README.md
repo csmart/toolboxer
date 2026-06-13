@@ -8,6 +8,7 @@ A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/
 - **Full host integration** — X11, Wayland, D-Bus, SSH agent, PulseAudio, and XDG runtime dir are all passed through via discrete socket mounts.
 - **User environment** — a matching user account with sudo access is created inside the container, with your UID/GID preserved.
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
+- **Nested podman** — rootless podman-in-podman works inside the container; `/dev/fuse` and `/dev/net/tun` are passed through when present (see [Running podman inside the container](#running-podman-inside-the-container)).
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
 - **toolbox-compatible CLI** — commands and flags match `toolbox` (`create`, `enter`, `run`, `list`, `rm`, `rmi`) with the same `-d`/`-r`/`-i`/`-c` flags.
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
@@ -247,8 +248,29 @@ The following host resources are passed into the container automatically (none o
 | SSH agent | `$SSH_AUTH_SOCK` socket | read-write |
 | systemd journal | `/run/systemd/journal` | read-only |
 | udev database | `/run/udev/data` | read-only |
+| FUSE / TUN devices | `/dev/fuse`, `/dev/net/tun` | device (if present) |
 
 Environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `TERM`, `LANG`, `XDG_RUNTIME_DIR`) are forwarded into the container.
+
+## Running podman inside the container
+
+`create` passes `/dev/fuse` (fuse-overlayfs storage) and `/dev/net/tun` (the
+pasta/slirp4netns network backend) into the container when those device nodes
+exist on the host, so rootless **podman-in-podman** works:
+
+```bash
+toolboxer run podman run hello-world
+```
+
+If `/dev/net/tun` is missing on the host, load the module first
+(`sudo modprobe tun`) and recreate the container.
+
+Note on user namespaces: the in-container user does not have its own
+`/etc/subuid`/`/etc/subgid` ranges, so the nested podman falls back to
+*single-UID mapping* (everything runs as your UID). This is fine for most
+images. Images that need multiple UIDs inside (e.g. that create and switch to a
+separate user) require subuid/subgid ranges set up in the container, which
+interacts with `--userns=keep-id` and is not configured automatically.
 
 ## Testing
 

@@ -432,6 +432,26 @@ build_env_args() {
     printf '%s\n' "${args[@]}"
 }
 
+# Devices needed to run rootless podman/buildah *inside* the container
+# (podman-in-podman):
+#   * /dev/fuse    — fuse-overlayfs storage driver for the nested podman
+#   * /dev/net/tun — the pasta/slirp4netns rootless network backend
+# Each is only passed through if present on the host, so hosts without them
+# (e.g. /dev/net/tun when the tun module isn't loaded) still create cleanly.
+build_device_args() {
+    local args=()
+    local -a nested_devices=(
+        /dev/fuse
+        /dev/net/tun
+    )
+    for dev in "${nested_devices[@]}"; do
+        [[ -e "$dev" ]] && args+=(--device "$dev")
+    done
+    # Emit nothing when empty — a blank line would become a spurious empty
+    # argument to `podman create`.
+    [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
+}
+
 default_workdir() {
     read_mount_dirs
     echo "${_MOUNT_ARRAY[0]}"
@@ -584,6 +604,7 @@ case "$cmd" in
         mapfile -t vol_args < <(build_volume_args)
         mapfile -t host_args < <(build_host_integration_args)
         mapfile -t env_args < <(build_env_args)
+        mapfile -t device_args < <(build_device_args)
 
         podman create -it \
             --name "$CONTAINER_NAME" \
@@ -596,6 +617,7 @@ case "$cmd" in
             "${vol_args[@]}" \
             "${host_args[@]}" \
             "${env_args[@]}" \
+            "${device_args[@]}" \
             --workdir "$(default_workdir)" \
             --label "toolbox=true" \
             --label "toolboxer=true" \
