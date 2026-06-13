@@ -8,7 +8,7 @@ A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/
 - **Full host integration** — X11, Wayland, D-Bus, SSH agent, PulseAudio, and XDG runtime dir are all passed through via discrete socket mounts.
 - **User environment** — a matching user account with sudo access is created inside the container, with your UID/GID preserved.
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
-- **Nested podman** — rootless podman-in-podman works inside the container; `/dev/fuse` and `/dev/net/tun` are passed through when present (see [Running podman inside the container](#running-podman-inside-the-container)).
+- **Nested podman** — rootless podman-in-podman works out of the box, with no required host devices (see [Running podman inside the container](#running-podman-inside-the-container)).
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
 - **toolbox-compatible CLI** — commands and flags match `toolbox` (`create`, `enter`, `run`, `list`, `rm`, `rmi`) with the same `-d`/`-r`/`-i`/`-c` flags.
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
@@ -254,23 +254,54 @@ Environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
 
 ## Running podman inside the container
 
-`create` passes `/dev/fuse` (fuse-overlayfs storage) and `/dev/net/tun` (the
-pasta/slirp4netns network backend) into the container when those device nodes
-exist on the host, so rootless **podman-in-podman** works:
+Rootless **podman-in-podman** works out of the box, with **no required host
+devices**:
 
 ```bash
 toolboxer run podman run hello-world
 ```
 
-If `/dev/net/tun` is missing on the host, load the module first
-(`sudo modprobe tun`) and recreate the container.
+This is achieved with the fewest possible host requirements:
+
+- **Networking** — on first start, toolboxer drops a containers.conf drop-in
+  (`/etc/containers/containers.conf.d/90-toolboxer-nested.conf`) that defaults
+  the nested podman to **host networking** (`netns=host`). Because the toolbox
+  itself already runs with `--network host`, nested containers share the host
+  network and need no `/dev/net/tun` (so no pasta/slirp4netns, and no `tun`
+  kernel module). Override per-container with `podman run --network pasta …` if
+  you have `/dev/net/tun` available.
+- **Storage** — on a modern kernel, the nested podman uses native rootless
+  overlay, so `/dev/fuse` isn't required. `/dev/fuse` and `/dev/net/tun` are
+  still passed through *when present* on the host (harmless), which lets
+  fuse-overlayfs and bridged/pasta networking work if you opt back into them.
+- **Capabilities** — the toolbox is created `--privileged`. In *rootless*
+  podman this grants no real host privilege (the container stays confined to
+  your rootless user namespace); it just gives the container the capabilities
+  you already have and unmasks `/proc`. Without it, the nested podman — which
+  falls back to single-UID mapping here (no subuid ranges) and so inherits
+  toolboxer's capped-down set — fails privileged-in-userns operations such as
+  mounting a fresh `procfs` (`crun: mount proc: Operation not permitted`) and
+  `sethostname` (`crun: sethostname: Operation not permitted`). This is the
+  same approach [distrobox](https://github.com/89luca89/distrobox) takes.
+- **Runtime isolation** — toolboxer bind-mounts your `$XDG_RUNTIME_DIR` (for
+  the Wayland/PulseAudio/D-Bus sockets), but shadows podman's own state dirs
+  inside it (`$XDG_RUNTIME_DIR/containers` and `.../libpod`) with empty
+  container-local tmpfs. This keeps the nested podman's runroot and
+  pause-process pid file separate from the host's. Without it, the nested
+  podman would overwrite the host's `…/libpod/tmp/pause.pid` with a pause
+  process living in the container's mount namespace, and — because the toolbox
+  runs with `--pid host` — subsequent **host** podman commands would join that
+  namespace and break with `stat …/.config: no such file or directory` until
+  the pause process was killed. (Trade-off: nested podman does not see host
+  registry logins, since `auth.json` lives under the shadowed `containers`
+  dir — run `podman login` again inside the toolbox for private registries.)
 
 Note on user namespaces: the in-container user does not have its own
 `/etc/subuid`/`/etc/subgid` ranges, so the nested podman falls back to
 *single-UID mapping* (everything runs as your UID). This is fine for most
 images. Images that need multiple UIDs inside (e.g. that create and switch to a
-separate user) require subuid/subgid ranges set up in the container, which
-interacts with `--userns=keep-id` and is not configured automatically.
+separate user) require subuid/subgid ranges, which interact with
+`--userns=keep-id` and are deliberately not configured automatically.
 
 ## Testing
 

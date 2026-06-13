@@ -392,6 +392,20 @@ build_host_integration_args() {
     local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [[ -d "$xdg_runtime" ]]; then
         args+=(--volume "$xdg_runtime:$xdg_runtime")
+        # Shadow podman's own runtime state under XDG_RUNTIME_DIR with empty,
+        # container-local tmpfs so a *nested* rootless podman does not share —
+        # and clobber — the host's runroot and pause-process pid file. Without
+        # this, running podman inside the toolbox overwrites the host's
+        # $XDG_RUNTIME_DIR/libpod/tmp/pause.pid with a pause process living in
+        # the container's mount namespace; because of --pid host that PID is
+        # valid on the host too, so subsequent *host* podman commands join that
+        # namespace and fail to see paths the toolbox doesn't mount (e.g.
+        # ~/.config) — breaking host podman until the pause process is killed.
+        # The GUI sockets (wayland/pulse/dbus) live at the top level of
+        # XDG_RUNTIME_DIR and are unaffected. ensure_started chowns these to the
+        # user on each start (the tmpfs come up root-owned).
+        args+=(--tmpfs "$xdg_runtime/containers")
+        args+=(--tmpfs "$xdg_runtime/libpod")
     fi
 
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
@@ -520,6 +534,14 @@ ensure_started() {
 
     # Container is created/stopped — start it
     podman start "$CONTAINER_NAME" >/dev/null 2>&1
+
+    # Hand the nested-podman runtime tmpfs (see build_host_integration_args) to
+    # our user; they are recreated root-owned on every start, so the nested
+    # rootless podman couldn't otherwise write its runroot/pause.pid there.
+    local xdg
+    xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    podman exec --user root "$CONTAINER_NAME" \
+        chown "$(id -u):$(id -g)" "$xdg/containers" "$xdg/libpod" 2>/dev/null || true
 
     # Run user setup on first start (check if sudoers file exists)
     local user_name
