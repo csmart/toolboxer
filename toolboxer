@@ -576,6 +576,18 @@ setup_user_in_container() {
 netns="host"
 EOF
     ' || true
+
+    # Mark interactive shells with a magenta hexagon, like toolbox/toolbx. Set
+    # the full prompt (rather than just prepending) so it survives regardless of
+    # whether the image's /etc/bashrc runs, and works on any base distro. A
+    # mounted user ~/.bashrc still overrides it (sourced after profile.d).
+    podman exec --user root -i "$cname" \
+        tee /etc/profile.d/toolboxer.sh >/dev/null <<'PROFILE' || true
+# Added by toolboxer: magenta hexagon prompt marker (like toolbox).
+if [ -n "${PS1-}" ]; then
+    PS1="\[\e[1;35m\]⬢\[\e[0m\] [\u@\h \W]\$ "
+fi
+PROFILE
 }
 
 ensure_exists() {
