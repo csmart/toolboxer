@@ -488,6 +488,22 @@ setup_user_in_container() {
     # Grant passwordless sudo
     podman exec --user root "$cname" mkdir -p /etc/sudoers.d
     podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
+
+    # Make rootless podman-in-podman work with the fewest host requirements:
+    # default the *nested* podman to host networking, so it needs no
+    # /dev/net/tun (pasta/slirp4netns) on the host. Storage falls back to
+    # native overlay on modern kernels, so /dev/fuse isn't required either.
+    # (A drop-in is used so it merges with, rather than replaces, the image's
+    # own containers.conf. Harmless when podman isn't installed.)
+    podman exec --user root "$cname" bash -c '
+        mkdir -p /etc/containers/containers.conf.d
+        cat > /etc/containers/containers.conf.d/90-toolboxer-nested.conf <<EOF
+# Added by toolboxer: host networking for nested (podman-in-podman) containers
+# so no /dev/net/tun is needed. Override per-container with e.g. --network pasta.
+[containers]
+netns="host"
+EOF
+    ' || true
 }
 
 ensure_exists() {
