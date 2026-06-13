@@ -109,8 +109,15 @@ _toolboxer() {
             COMPREPLY=($(compgen -W "-c --containers -i --images -h --help" -- "$cur"))
             ;;
         rm)
+            case "$prev" in
+                -d|--distro)
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    return
+                    ;;
+                -r|--release) return ;;
+            esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-a --all -f --force -h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-a --all -f --force -d --distro -r --release -h --help" -- "$cur"))
             else
                 local containers
                 containers=$(podman container list --all --filter "label=toolboxer=true" --format '{{.Names}}' 2>/dev/null)
@@ -127,8 +134,15 @@ _toolboxer() {
             fi
             ;;
         stop)
+            case "$prev" in
+                -d|--distro)
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    return
+                    ;;
+                -r|--release) return ;;
+            esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-d --distro -r --release -h --help" -- "$cur"))
             else
                 local containers
                 containers=$(podman container list --all --filter "label=toolboxer=true" --format '{{.Names}}' 2>/dev/null)

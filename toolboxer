@@ -264,16 +264,21 @@ usage_rm() {
 Usage: $prog rm [options] [CONTAINER...]
 
 Remove one or more toolboxer containers. With no names and no --all, the
-default container is removed. Running containers need --force.
+container is resolved the same way as 'create' — from --distro/--release (or
+the host defaults) — so you can remove a container without typing its full
+name. Running containers need --force.
 
 Options:
   -a, --all             Remove all toolboxer containers
   -f, --force           Force removal of running containers
+  -d, --distro DISTRO   Remove the container for a different distro
+  -r, --release RELEASE Remove the container for a different release
   -h, --help            Show this help
 
 Examples:
   $prog rm
   $prog rm my-project another-project
+  $prog rm -r 44                  # removes the fedora-toolbox-44 container
   $prog rm --all --force
 EOF
     exit "${1:-1}"
@@ -304,17 +309,21 @@ usage_stop() {
     local prog
     prog="$(basename "$0")"
     cat <<EOF
-Usage: $prog stop [CONTAINER]
+Usage: $prog stop [options] [CONTAINER]
 
-Stop a running toolboxer container. If no container is named, the default
-(or the single existing toolboxer container) is stopped.
+Stop a running toolboxer container. If no container is named, it is resolved
+from --distro/--release (or the host defaults); if none of those match and only
+one toolboxer container exists, that one is stopped.
 
 Options:
+  -d, --distro DISTRO   Stop the container for a different distro
+  -r, --release RELEASE Stop the container for a different release
   -h, --help            Show this help
 
 Examples:
   $prog stop
   $prog stop my-project
+  $prog stop -r 44                # stops the fedora-toolbox-44 container
 EOF
     exit "${1:-1}"
 }
@@ -704,12 +713,14 @@ case "$cmd" in
         ;;
 
     stop)
-        # Parse positional container name
+        # Parse stop-specific flags / positional container name
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -h|--help) usage_stop 0 ;;
-                -*)        echo "Unknown stop option: $1"; usage_stop ;;
-                *)         CONTAINER_NAME="$1"; shift ;;
+                -d|--distro)  DISTRO="$2";  shift 2 ;;
+                -r|--release) RELEASE="$2"; shift 2 ;;
+                -h|--help)    usage_stop 0 ;;
+                -*)           echo "Unknown stop option: $1"; usage_stop ;;
+                *)            CONTAINER_NAME="$1"; shift ;;
             esac
         done
 
@@ -728,11 +739,13 @@ case "$cmd" in
         local_containers=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -a|--all)   local_all=true;            shift ;;
-                -f|--force) local_force=true;           shift ;;
-                -h|--help)  usage_rm 0 ;;
-                -*)         echo "Unknown rm option: $1"; usage_rm ;;
-                *)          local_containers+=("$1");   shift ;;
+                -a|--all)     local_all=true;             shift ;;
+                -f|--force)   local_force=true;           shift ;;
+                -d|--distro)  DISTRO="$2";                shift 2 ;;
+                -r|--release) RELEASE="$2";               shift 2 ;;
+                -h|--help)    usage_rm 0 ;;
+                -*)           echo "Unknown rm option: $1"; usage_rm ;;
+                *)            local_containers+=("$1");   shift ;;
             esac
         done
 

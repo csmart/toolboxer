@@ -152,7 +152,11 @@ Running `toolboxer` with no command defaults to `enter`.
 |--------|-------------|
 | `-a`, `--all` | Remove all toolboxer containers |
 | `-f`, `--force` | Force removal of running containers |
+| `-d`, `--distro DISTRO` | Remove the container for a different distro |
+| `-r`, `--release RELEASE` | Remove the container for a different release |
 | `[CONTAINER...]` | Container name(s) (positional) |
+
+With no name, `rm` (like `enter`/`run`/`stop`) resolves the container from `-d`/`-r` (or the host defaults), so `toolboxer rm -r 44` removes `fedora-toolbox-44` without typing the full name.
 
 ### `rmi` options
 
