@@ -622,10 +622,19 @@ case "$cmd" in
         mapfile -t env_args < <(build_env_args)
         mapfile -t device_args < <(build_device_args)
 
+        # --privileged: in *rootless* podman this grants no real host privilege
+        # (the container is still confined to your rootless user namespace) — it
+        # just hands the container the capabilities you already have and unmasks
+        # /proc. Without it, a *nested* rootless podman (which falls back to
+        # single-UID mapping here, having no subuid ranges) inherits toolboxer's
+        # capped-down set and fails privileged-in-userns operations such as
+        # `sethostname` and mounting a fresh /proc. This is the same approach
+        # distrobox takes. (It supersedes `--security-opt unmask=ALL`.)
         podman create -it \
             --name "$CONTAINER_NAME" \
             --userns=keep-id \
             --security-opt label=disable \
+            --privileged \
             --hostname toolboxer \
             --network host \
             --ipc host \
