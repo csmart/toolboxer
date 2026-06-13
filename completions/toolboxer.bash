@@ -7,7 +7,7 @@ _toolboxer() {
     _init_completion || return
 
     local commands="create enter run list stop rm rmi help"
-    local global_opts="-m --mount -h --help"
+    local global_opts="-m --mount -A --ai-agents -h --help"
 
     # Find the subcommand position (skip global options and their arguments)
     local cmd_idx cmd=""
@@ -66,7 +66,7 @@ _toolboxer() {
                     ;;
             esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -A --ai-agents -h --help" -- "$cur"))
             fi
             ;;
         enter)

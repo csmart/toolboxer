@@ -9,6 +9,7 @@ A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/
 - **User environment** — a matching user account with sudo access is created inside the container, with your UID/GID preserved.
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
 - **Nested podman** — rootless podman-in-podman works out of the box, with no required host devices (see [Running podman inside the container](#running-podman-inside-the-container)).
+- **AI agents** — `--ai-agents` shares the config of AI agent CLIs (Claude Code, Codex, Gemini, Aider, …) from your home into the container so they run with your existing login.
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
 - **toolbox-compatible CLI** — commands and flags match `toolbox` (`create`, `enter`, `run`, `list`, `rm`, `rmi`) with the same `-d`/`-r`/`-i`/`-c` flags.
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
@@ -122,6 +123,7 @@ Running `toolboxer` with no command defaults to `enter`.
 | `-i`, `--image NAME` | Use a custom image (incompatible with `--distro`/`--release`) |
 | `-r`, `--release RELEASE` | Use a different release (incompatible with `--image`) |
 | `-m`, `--mount DIR` | Directory to mount (repeatable) |
+| `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
 | `[CONTAINER]` | Container name (positional) |
 
 ### `enter` options
@@ -172,6 +174,7 @@ With no name, `rm` (like `enter`/`run`/`stop`) resolves the container from `-d`/
 | Option | Description |
 |--------|-------------|
 | `-m`, `--mount DIR` | Directory to mount — repeatable (default: `~/code`) |
+| `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
 | `-h`, `--help` | Show help |
 
 ### Environment variables
@@ -202,6 +205,9 @@ toolboxer create --distro ubuntu --release 24.04
 
 # Create a container that mounts two directories
 toolboxer -m ~/code -m ~/documents create
+
+# Create a container that also shares your AI agent logins (claude, codex, …)
+toolboxer --ai-agents create
 
 # Give the container a custom name
 toolboxer create my-project
@@ -302,6 +308,29 @@ Note on user namespaces: the in-container user does not have its own
 images. Images that need multiple UIDs inside (e.g. that create and switch to a
 separate user) require subuid/subgid ranges, which interact with
 `--userns=keep-id` and are deliberately not configured automatically.
+
+## AI agents
+
+Pass `-A`/`--ai-agents` to `create` (or as a global option) to bind-mount the
+config/data directories of AI agent CLIs found in your home into the container
+at the **same paths**, read-write. Because the container's `$HOME` matches the
+host's (and is otherwise unmounted) and `--userns=keep-id` preserves your UID,
+each agent finds its config exactly where it expects and shares your existing
+host login, settings, and sessions:
+
+```bash
+toolboxer --ai-agents create
+toolboxer run claude     # uses your host login, no re-auth
+```
+
+Only directories that exist are mounted, so it's safe regardless of which agents
+you have installed. The agent **CLI binary itself is not mounted** — install it
+inside the container (or in a mounted directory) as usual; this flag only shares
+its configuration. Recognised agents include Claude Code (`~/.claude`),
+OpenAI Codex (`~/.codex`), Gemini CLI (`~/.gemini`), Qwen Code, Cursor, Grok,
+Continue, GitHub Copilot CLI, Goose, OpenCode, Crush, Aider, `llm`, Shell-GPT,
+and Open Interpreter. The list lives in `AI_AGENT_PATHS` near the top of the
+`toolboxer` script — add new agents there.
 
 ## Testing
 

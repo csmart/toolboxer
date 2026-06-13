@@ -119,6 +119,9 @@ Global options (must come before the command):
   -m, --mount DIR         Mount DIR (read-write) into the container. Repeat the
                           flag once per directory. This replaces the default
                           mount ($DEFAULT_MOUNT_DIRS) rather than adding to it.
+  -A, --ai-agents         Also mount the config of any AI agent CLIs found in
+                          your home (Claude Code, Codex, Gemini, Aider, …) so
+                          they run inside the container with your host login.
   -h, --help              Show this help
 
 Each command has its own options too — see '$prog <command> --help'.
@@ -144,6 +147,7 @@ Examples:
   $prog                                # enter the default container
   $prog create                         # create the default container
   $prog -m ~/code -m ~/docs create     # create, mounting two directories
+  $prog --ai-agents create             # create, sharing your AI agent logins
   $prog create --distro ubuntu --release 24.04
   $prog create --image fedora:41 my-project
   $prog enter my-project               # enter a named container
@@ -173,11 +177,18 @@ Options:
   -m, --mount DIR       Mount DIR (read-write); repeat once per directory.
                         Replaces the default mount ($DEFAULT_MOUNT_DIRS).
                         The first mounted directory becomes the working directory.
+  -A, --ai-agents       Also mount the config/data dirs of AI agent CLIs found
+                        in your home (Claude Code, Codex, Gemini, Aider, Goose,
+                        OpenCode, …) at the same paths, so they run inside the
+                        container using your existing host login/sessions. Only
+                        dirs that exist are mounted; the agent CLI itself must
+                        be installed in the container.
   -h, --help            Show this help
 
 Examples:
   $prog create
   $prog create -m ~/code -m ~/documents
+  $prog create --ai-agents
   $prog create --distro ubuntu --release 24.04 ubuntu-dev
   $prog create --image fedora:41
 EOF
@@ -333,13 +344,15 @@ EOF
 # ---------------------------------------------------------------------------
 
 cli_mounts=()
+copy_ai_agents=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -m|--mount) cli_mounts+=("$2");  shift 2 ;;
-        -h|--help)  usage 0 ;;
-        -*)         echo "Unknown option: $1"; usage ;;
-        *)          break ;;
+        -m|--mount)     cli_mounts+=("$2");  shift 2 ;;
+        -A|--ai-agents) copy_ai_agents=true; shift ;;
+        -h|--help)      usage 0 ;;
+        -*)             echo "Unknown option: $1"; usage ;;
+        *)              break ;;
     esac
 done
 
@@ -464,6 +477,51 @@ build_device_args() {
     # Emit nothing when empty — a blank line would become a spurious empty
     # argument to `podman create`.
     [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
+}
+
+# Home-relative config/data paths for popular AI agent CLIs. With --ai-agents,
+# any of these that exist on the host are bind-mounted read-write at the SAME
+# path inside the container (the container's $HOME matches the host's and is
+# otherwise unmounted, and --userns=keep-id preserves your UID, so the agent
+# finds its config exactly where it expects and shares your host login/sessions).
+# Missing paths are skipped, so listing several candidates per agent is safe;
+# add new agents here as they appear.
+AI_AGENT_PATHS=(
+    .claude .claude.json                        # Claude Code (Anthropic)
+    .codex                                      # OpenAI Codex
+    .gemini                                     # Gemini CLI (Google)
+    .qwen                                       # Qwen Code
+    .cursor                                     # Cursor agent
+    .grok .config/grok                          # Grok CLI (xAI)
+    .continue                                   # Continue
+    .config/github-copilot .copilot             # GitHub Copilot CLI
+    .config/goose .local/share/goose            # Goose (Block)
+    .config/opencode .local/share/opencode      # OpenCode
+    .config/crush .local/share/crush            # Crush (Charm)
+    .aider.conf.yml .aider.model.settings.yml .aider.model.metadata.json .config/aider  # Aider
+    .config/io.datasette.llm                    # llm (Datasette)
+    .config/shell_gpt                           # Shell-GPT (sgpt)
+    .config/open-interpreter                    # Open Interpreter
+)
+
+build_ai_agent_args() {
+    local args=() p
+    for p in "${AI_AGENT_PATHS[@]}"; do
+        # No SELinux relabel (:z): the container already runs with
+        # `label=disable`, so relabeling the user's real config dirs is both
+        # unnecessary and undesirable.
+        [[ -e "$HOME/$p" ]] && args+=(--volume "$HOME/$p:$HOME/$p")
+    done
+    [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
+}
+
+# The agent paths that were actually found, for display.
+found_ai_agents() {
+    local p found=()
+    for p in "${AI_AGENT_PATHS[@]}"; do
+        [[ -e "$HOME/$p" ]] && found+=("$p")
+    done
+    printf '%s\n' "${found[*]}"
 }
 
 default_workdir() {
@@ -606,6 +664,7 @@ case "$cmd" in
                 -i|--image)   IMAGE="$2";   shift 2 ;;
                 -r|--release) RELEASE="$2"; shift 2 ;;
                 -m|--mount)   cli_mounts+=("$2"); shift 2 ;;
+                -A|--ai-agents) copy_ai_agents=true; shift ;;
                 -h|--help)    usage_create 0 ;;
                 -*)           echo "Unknown create option: $1"; usage_create ;;
                 *)            CONTAINER_NAME="$1"; shift ;;
@@ -644,6 +703,17 @@ case "$cmd" in
         mapfile -t env_args < <(build_env_args)
         mapfile -t device_args < <(build_device_args)
 
+        agent_args=()
+        if [[ "$copy_ai_agents" == true ]]; then
+            mapfile -t agent_args < <(build_ai_agent_args)
+            found="$(found_ai_agents)"
+            if [[ -n "$found" ]]; then
+                echo "AI agent config: $found"
+            else
+                echo "AI agent config: none found in $HOME"
+            fi
+        fi
+
         # --privileged: in *rootless* podman this grants no real host privilege
         # (the container is still confined to your rootless user namespace) — it
         # just hands the container the capabilities you already have and unmasks
@@ -665,6 +735,7 @@ case "$cmd" in
             "${host_args[@]}" \
             "${env_args[@]}" \
             "${device_args[@]}" \
+            "${agent_args[@]}" \
             --workdir "$(default_workdir)" \
             --label "toolbox=true" \
             --label "toolboxer=true" \
@@ -698,6 +769,7 @@ case "$cmd" in
                 for d in "${cli_mounts[@]}"; do
                     reinvoke_args+=(-m "$d")
                 done
+                [[ "$copy_ai_agents" == true ]] && reinvoke_args+=(--ai-agents)
                 reinvoke_args+=(create)
                 [[ -n "$DISTRO" ]] && reinvoke_args+=(--distro "$DISTRO")
                 [[ -n "$RELEASE" ]] && reinvoke_args+=(--release "$RELEASE")
