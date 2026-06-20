@@ -2,6 +2,8 @@
 
 A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/) command, written in Bash. It creates Podman containers for development work but restricts volume mounts to only the directories you specify, rather than exposing your entire home directory.
 
+A motivating use case is **running AI coding agents without trusting them with your whole machine**. By default the container can only see the directories you mount (just `~/code`) — not the rest of your home, your SSH keys, or the wider filesystem — so an agent can work on your code without access to anything outside it. The `--ai-agents` flag then shares just each agent's own config so it runs with your existing login (see [AI agents](#ai-agents)).
+
 ## Features
 
 - **Restricted mounts** — only selected directories are bind-mounted into the container (default: `~/code`). Your home directory is never mounted.
