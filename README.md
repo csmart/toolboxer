@@ -296,7 +296,7 @@ This is achieved with the fewest possible host requirements:
 - **Runtime isolation** — toolboxer bind-mounts your `$XDG_RUNTIME_DIR` (for
   the Wayland/PulseAudio/D-Bus sockets), but shadows podman's own state dirs
   inside it (`$XDG_RUNTIME_DIR/containers` and `.../libpod`) with empty
-  container-local tmpfs. This keeps the nested podman's runroot and
+  container-local volumes. This keeps the nested podman's runroot and
   pause-process pid file separate from the host's. Without it, the nested
   podman would overwrite the host's `…/libpod/tmp/pause.pid` with a pause
   process living in the container's mount namespace, and — because the toolbox
