@@ -3,6 +3,8 @@
 
 set -euo pipefail
 
+prog="$(basename "$0")"
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -13,6 +15,7 @@ HOST_ID="fedora"
 HOST_VERSION_ID="latest"
 HOST_ID_LIKE=""
 if [[ -f /etc/os-release ]]; then
+    # shellcheck source=/dev/null
     source /etc/os-release
     HOST_ID="${ID:-fedora}"
     HOST_VERSION_ID="${VERSION_ID:-latest}"
@@ -91,8 +94,6 @@ PRESERVE_FDS=""
 # ---------------------------------------------------------------------------
 
 usage() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 toolboxer — a restricted, drop-in replacement for toolbox.
 
@@ -162,8 +163,6 @@ EOF
 }
 
 usage_create() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog create [options] [CONTAINER]
 
@@ -200,8 +199,6 @@ EOF
 }
 
 usage_enter() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog enter [options] [CONTAINER]
 
@@ -227,8 +224,6 @@ EOF
 }
 
 usage_run() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog run [options] [--] COMMAND [ARGS...]
 
@@ -253,8 +248,6 @@ EOF
 }
 
 usage_list() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog list [options]
 
@@ -274,8 +267,6 @@ EOF
 }
 
 usage_rm() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog rm [options] [CONTAINER...]
 
@@ -301,8 +292,6 @@ EOF
 }
 
 usage_rmi() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog rmi [options] <IMAGE...>
 
@@ -322,8 +311,6 @@ EOF
 }
 
 usage_stop() {
-    local prog
-    prog="$(basename "$0")"
     cat <<EOF
 Usage: $prog stop [options] [CONTAINER]
 
@@ -412,18 +399,10 @@ build_host_integration_args() {
     local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [[ -d "$xdg_runtime" ]]; then
         args+=(--volume "$xdg_runtime:$xdg_runtime")
-        # Shadow podman's own runtime state under XDG_RUNTIME_DIR with empty,
-        # container-local tmpfs so a *nested* rootless podman does not share —
-        # and clobber — the host's runroot and pause-process pid file. Without
-        # this, running podman inside the toolbox overwrites the host's
-        # $XDG_RUNTIME_DIR/libpod/tmp/pause.pid with a pause process living in
-        # the container's mount namespace; because of --pid host that PID is
-        # valid on the host too, so subsequent *host* podman commands join that
-        # namespace and fail to see paths the toolbox doesn't mount (e.g.
-        # ~/.config) — breaking host podman until the pause process is killed.
-        # The GUI sockets (wayland/pulse/dbus) live at the top level of
-        # XDG_RUNTIME_DIR and are unaffected. ensure_started chowns these to the
-        # user on each start (the tmpfs come up root-owned).
+        # Shadow podman's runtime state with empty container-local tmpfs so a
+        # nested rootless podman keeps its runroot and pause file to itself
+        # rather than clobbering the host's (see README). The GUI sockets at the
+        # top level of XDG_RUNTIME_DIR are unaffected.
         args+=(--tmpfs "$xdg_runtime/containers")
         args+=(--tmpfs "$xdg_runtime/libpod")
     fi
@@ -466,12 +445,8 @@ build_env_args() {
     printf '%s\n' "${args[@]}"
 }
 
-# Devices needed to run rootless podman/buildah *inside* the container
-# (podman-in-podman):
-#   * /dev/fuse    — fuse-overlayfs storage driver for the nested podman
-#   * /dev/net/tun — the pasta/slirp4netns rootless network backend
-# Each is only passed through if present on the host, so hosts without them
-# (e.g. /dev/net/tun when the tun module isn't loaded) still create cleanly.
+# Pass /dev/fuse and /dev/net/tun through for nested rootless podman, but only
+# when present so hosts without them still create cleanly.
 build_device_args() {
     local args=()
     local -a nested_devices=(
@@ -487,12 +462,8 @@ build_device_args() {
 }
 
 # Home-relative config/data paths for popular AI agent CLIs. With --ai-agents,
-# any of these that exist on the host are bind-mounted read-write at the SAME
-# path inside the container (the container's $HOME matches the host's and is
-# otherwise unmounted, and --userns=keep-id preserves your UID, so the agent
-# finds its config exactly where it expects and shares your host login/sessions).
-# Missing paths are skipped, so listing several candidates per agent is safe;
-# add new agents here as they appear.
+# any that exist on the host are bind-mounted into the container at the same
+# path (see README). Missing paths are skipped, so extra candidates are safe.
 AI_AGENT_PATHS=(
     .claude .claude.json                        # Claude Code (Anthropic)
     .codex                                      # OpenAI Codex
@@ -568,12 +539,8 @@ setup_user_in_container() {
     podman exec --user root "$cname" mkdir -p /etc/sudoers.d
     podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
 
-    # Make rootless podman-in-podman work with the fewest host requirements:
-    # default the *nested* podman to host networking, so it needs no
-    # /dev/net/tun (pasta/slirp4netns) on the host. Storage falls back to
-    # native overlay on modern kernels, so /dev/fuse isn't required either.
-    # (A drop-in is used so it merges with, rather than replaces, the image's
-    # own containers.conf. Harmless when podman isn't installed.)
+    # Default the nested podman to host networking so it needs no /dev/net/tun
+    # (see README). A drop-in merges with the image's own containers.conf.
     podman exec --user root "$cname" bash -c '
         mkdir -p /etc/containers/containers.conf.d
         cat > /etc/containers/containers.conf.d/90-toolboxer-nested.conf <<EOF
@@ -584,10 +551,9 @@ netns="host"
 EOF
     ' || true
 
-    # Mark interactive shells with a magenta hexagon, like toolbox/toolbx. Set
-    # the full prompt (rather than just prepending) so it survives regardless of
-    # whether the image's /etc/bashrc runs, and works on any base distro. A
-    # mounted user ~/.bashrc still overrides it (sourced after profile.d).
+    # Mark interactive shells with a magenta hexagon, like toolbox. The full
+    # prompt is set (not prepended) so it survives the image's bashrc; a
+    # mounted ~/.bashrc still overrides it.
     podman exec --user root -i "$cname" \
         tee /etc/profile.d/toolboxer.sh >/dev/null <<'PROFILE' || true
 # Added by toolboxer: magenta hexagon prompt marker (like toolbox).
@@ -612,9 +578,9 @@ ensure_started() {
     # Container is created/stopped — start it
     podman start "$CONTAINER_NAME" >/dev/null 2>&1
 
-    # Hand the nested-podman runtime tmpfs (see build_host_integration_args) to
-    # our user; they are recreated root-owned on every start, so the nested
-    # rootless podman couldn't otherwise write its runroot/pause.pid there.
+    # The nested-podman runtime tmpfs (see build_host_integration_args) come up
+    # root-owned each start; hand them to our user so the nested podman can use
+    # them.
     local xdg
     xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     podman exec --user root "$CONTAINER_NAME" \
@@ -709,7 +675,7 @@ case "$cmd" in
 
         if ensure_exists; then
             echo "Error: Container '$CONTAINER_NAME' already exists."
-            echo "Remove it first with: $(basename "$0") rm"
+            echo "Remove it first with: $prog rm"
             exit 1
         fi
 
@@ -726,9 +692,9 @@ case "$cmd" in
         agent_args=()
         if [[ "$copy_ai_agents" == true ]]; then
             mapfile -t agent_args < <(build_ai_agent_args)
-            found="$(found_ai_agents)"
-            if [[ -n "$found" ]]; then
-                echo "AI agent config: $found"
+            found_paths="$(found_ai_agents)"
+            if [[ -n "$found_paths" ]]; then
+                echo "AI agent config: $found_paths"
             else
                 echo "AI agent config: none found in $HOME"
             fi
@@ -738,14 +704,9 @@ case "$cmd" in
         authfile_args=()
         [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
 
-        # --privileged: in *rootless* podman this grants no real host privilege
-        # (the container is still confined to your rootless user namespace) — it
-        # just hands the container the capabilities you already have and unmasks
-        # /proc. Without it, a *nested* rootless podman (which falls back to
-        # single-UID mapping here, having no subuid ranges) inherits toolboxer's
-        # capped-down set and fails privileged-in-userns operations such as
-        # `sethostname` and mounting a fresh /proc. This is the same approach
-        # distrobox takes. (It supersedes `--security-opt unmask=ALL`.)
+        # --privileged gives the single-UID-mapped nested podman the caps it
+        # needs (sethostname, mounting /proc). In rootless podman this is not
+        # real host privilege — just the caps you already have (see README).
         podman create -it \
             --name "$CONTAINER_NAME" \
             --userns=keep-id \
@@ -768,7 +729,7 @@ case "$cmd" in
             sleep infinity
 
         echo "Restricted toolbox '$CONTAINER_NAME' created!"
-        echo "Run '$(basename "$0") enter' to start using it."
+        echo "Run '$prog enter' to start using it."
         ;;
 
     enter)
@@ -833,7 +794,7 @@ case "$cmd" in
 
         if [[ $# -eq 0 ]]; then
             echo "Error: 'run' requires a command."
-            echo "Usage: $(basename "$0") run <command> [args...]"
+            echo "Usage: $prog run <command> [args...]"
             exit 1
         fi
 
@@ -841,7 +802,7 @@ case "$cmd" in
 
         if ! resolve_container; then
             echo "Error: No toolboxer container found."
-            echo "Create one first with: $(basename "$0") create"
+            echo "Create one first with: $prog create"
             exit 1
         fi
         ensure_started
