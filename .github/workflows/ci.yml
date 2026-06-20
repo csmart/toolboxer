@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      # Install before checkout: the bare Fedora image has neither git (which
+      # actions/checkout needs) nor shellcheck.
+      - name: install dependencies
+        run: dnf install -y git ShellCheck
+
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck toolboxer tests/test_toolboxer.bash
+
+      - name: syntax check
+        run: |
+          bash -n toolboxer
+          bash -n completions/toolboxer.bash
+
+      - name: smoke tests
+        # Integration tests need a working rootless podman; the CLI tests run
+        # without one, so skip the podman half here.
+        run: TOOLBOXER_SKIP_PODMAN=1 ./tests/test_toolboxer.bash

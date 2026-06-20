@@ -96,7 +96,9 @@ fi
 echo ""
 echo "=== Podman integration tests ==="
 
-if ! command -v podman &>/dev/null; then
+if [[ -n "${TOOLBOXER_SKIP_PODMAN:-}" ]]; then
+    echo "  SKIP: TOOLBOXER_SKIP_PODMAN set, skipping integration tests"
+elif ! command -v podman &>/dev/null; then
     echo "  SKIP: podman not found, skipping integration tests"
 else
     run_test
