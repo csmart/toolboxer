@@ -6,8 +6,8 @@ _toolboxer() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="create enter run list stop rm rmi help"
-    local global_opts="-m --mount -A --ai-agents -y --assumeyes --privileged --isolated -h --help"
+    local commands="create enter run list stop rm rmi config help"
+    local global_opts="-m --mount -A --ai-agents --no-ai-agents -y --assumeyes --no-assumeyes --privileged --no-privileged --isolated --no-isolated -h --help"
 
     # Find the subcommand position (skip global options and their arguments)
     local cmd_idx cmd=""
@@ -70,7 +70,7 @@ _toolboxer() {
                     ;;
             esac
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -A --ai-agents --authfile --privileged --isolated -h --help" -- "$cur"))
+                COMPREPLY=($(compgen -W "-d --distro -i --image -r --release -m --mount -A --ai-agents --no-ai-agents --authfile --privileged --no-privileged --isolated --no-isolated -h --help" -- "$cur"))
             fi
             ;;
         enter)
@@ -136,6 +136,11 @@ _toolboxer() {
                 local images
                 images=$(podman image list --filter "reference=*toolbox*" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)
                 COMPREPLY=($(compgen -W "$images" -- "$cur"))
+            fi
+            ;;
+        config)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
             fi
             ;;
         stop)

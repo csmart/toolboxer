@@ -77,17 +77,231 @@ resolve_name() {
     echo "${distro}-toolbox-${release}"
 }
 
-# Overridable via env vars (CLI flags take precedence). Inherit env values
-# here — `=""` would silently clobber what the user exported.
-MOUNT_DIRS="${MOUNT_DIRS:-$DEFAULT_MOUNT_DIRS}"
-CONTAINER_NAME="${CONTAINER_NAME:-}"
-IMAGE="${IMAGE:-}"
+# ---------------------------------------------------------------------------
+# Configuration file
+# ---------------------------------------------------------------------------
+# Settings resolve by precedence:
+#   CLI flags  >  environment variables  >  config file  >  built-in defaults
+# The config file is a simple "key = value" file (see the "Configuration file"
+# section of --help for the keys). Its location is $TOOLBOXER_CONFIG, else
+# $XDG_CONFIG_HOME/toolboxer/config, else ~/.config/toolboxer/config.
 
-# These will be set after flag parsing
-DISTRO=""
-RELEASE=""
-AUTHFILE=""
+# Capture env values before defaults/config fill them in, so the precedence
+# above can be applied. `=""` here would clobber what the user exported.
+env_mount_dirs="${MOUNT_DIRS:-}"
+env_container_name="${CONTAINER_NAME:-}"
+env_image="${IMAGE:-}"
+
+# Values read from the config file (empty/false until load_config runs).
+config_mounts=()
+config_ai_agents=""
+config_assumeyes=""
+config_privileged=""
+config_isolated=""
+config_image=""
+config_distro=""
+config_release=""
+config_container_name=""
+config_authfile=""
+
+CONFIG_FILE="${TOOLBOXER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/toolboxer/config}"
+
+# Expand a leading ~ or ~/ to $HOME in a config value (the shell does not do
+# tilde expansion on text read from a file). The tilde is kept in $t so it
+# isn't written as a quoted ~ (SC2088) — matching it literally is intentional.
+expand_tilde() {
+    local t='~'
+    case "$1" in
+        "$t"|"$t/"*) printf '%s\n' "$HOME${1#"$t"}" ;;
+        *)           printf '%s\n' "$1" ;;
+    esac
+}
+
+# Normalise a boolean config value to "true"/"false"; warn and use false on
+# anything unrecognised.
+parse_bool() {
+    case "${1,,}" in
+        true|yes|on|1)     printf 'true\n' ;;
+        false|no|off|0|"") printf 'false\n' ;;
+        *) echo "Warning: invalid boolean '$1' in $CONFIG_FILE (use true/false)" >&2
+           printf 'false\n' ;;
+    esac
+}
+
+# Read CONFIG_FILE (if present) into the config_* variables. Format: one
+# "key = value" per line; '#' starts a comment; blank lines are ignored;
+# "key value" (no '=') is also accepted. The 'mount' key may be repeated and/or
+# comma-separated. Unknown keys and bad booleans warn but don't abort.
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    local lineno=0 line key value oldifs m
+    local -a parts
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%%#*}"                            # strip comments
+        line="${line#"${line%%[![:space:]]*}"}"       # trim leading space
+        line="${line%"${line##*[![:space:]]}"}"       # trim trailing space
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" == *=* ]]; then
+            key="${line%%=*}"
+            value="${line#*=}"
+        else                                          # allow "key value"
+            key="${line%%[[:space:]]*}"
+            value="${line#"$key"}"
+        fi
+        key="${key#"${key%%[![:space:]]*}"}";        key="${key%"${key##*[![:space:]]}"}"
+        value="${value#"${value%%[![:space:]]*}"}";  value="${value%"${value##*[![:space:]]}"}"
+        key="${key//-/_}"; key="${key,,}"
+
+        case "$key" in
+            mount|mount_dirs)
+                # Comma separates several mounts; ':' is reserved for src:dest
+                # (see add_mount_spec). The key may also just be repeated.
+                oldifs="$IFS"; IFS=","; read -ra parts <<< "$value"; IFS="$oldifs"
+                for m in "${parts[@]}"; do
+                    m="${m#"${m%%[![:space:]]*}"}"; m="${m%"${m##*[![:space:]]}"}"
+                    [[ -n "$m" ]] && config_mounts+=("$m")
+                done
+                ;;
+            ai_agents)                config_ai_agents="$(parse_bool "$value")" ;;
+            assumeyes|assume_yes)     config_assumeyes="$(parse_bool "$value")" ;;
+            privileged)               config_privileged="$(parse_bool "$value")" ;;
+            isolated)                 config_isolated="$(parse_bool "$value")" ;;
+            image)                    config_image="$value" ;;
+            distro)                   config_distro="$value" ;;
+            release)                  config_release="$value" ;;
+            container_name|container) config_container_name="$value" ;;
+            authfile)                 config_authfile="$(expand_tilde "$value")" ;;
+            "")                       : ;;
+            *) echo "Warning: unknown config key '$key' in $CONFIG_FILE (line $lineno)" >&2 ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+load_config
+
+# Seed the working variables by precedence (CLI flags, parsed later, win over
+# all of these). The mounts and the on/off modes are resolved after parsing by
+# resolve_mount_dirs / resolve_modes below.
+CONTAINER_NAME="${env_container_name:-$config_container_name}"
+IMAGE="${env_image:-$config_image}"
+DISTRO="$config_distro"
+RELEASE="$config_release"
+AUTHFILE="$config_authfile"
 PRESERVE_FDS=""
+
+# Resolved mounts, one canonical "src:dest" spec per element (bare paths are
+# stored as "src:src"). Populated by resolve_mount_dirs.
+MOUNT_SPECS=()
+
+# Append a mount spec to MOUNT_SPECS: "src" (same path) or "src:dest" (custom
+# target), like podman -v. Leading ~ expanded on each side; stored as "src:dest".
+add_mount_spec() {
+    local spec="$1" src dest
+    if [[ "$spec" == *:* ]]; then
+        src="$(expand_tilde "${spec%%:*}")"
+        dest="$(expand_tilde "${spec#*:}")"
+    else
+        src="$(expand_tilde "$spec")"
+        dest="$src"
+    fi
+    if [[ -z "$src" || -z "$dest" ]]; then
+        echo "Warning: ignoring invalid mount '$spec' (expected src or src:dest)" >&2
+        return
+    fi
+    MOUNT_SPECS+=("$src:$dest")
+}
+
+# Split a comma-separated list of specs (the env var / a config value) and add
+# each. Whitespace around a spec is trimmed.
+add_mount_list() {
+    local oldifs="$IFS" item
+    local -a items
+    IFS=","; read -ra items <<< "$1"; IFS="$oldifs"
+    for item in "${items[@]}"; do
+        item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
+        [[ -n "$item" ]] && add_mount_spec "$item"
+    done
+}
+
+# Resolve the mounts by precedence: CLI -m/--mount > $MOUNT_DIRS env >
+# config-file mount(s) > built-in default. Each -m and each config value is one
+# spec; the env var and config values may hold a comma-separated list. Re-run
+# after each parsing pass.
+resolve_mount_dirs() {
+    local d
+    MOUNT_SPECS=()
+    if [[ ${#cli_mounts[@]} -gt 0 ]]; then
+        for d in "${cli_mounts[@]}"; do add_mount_spec "$d"; done
+    elif [[ -n "$env_mount_dirs" ]]; then
+        add_mount_list "$env_mount_dirs"
+    elif [[ ${#config_mounts[@]} -gt 0 ]]; then
+        for d in "${config_mounts[@]}"; do add_mount_spec "$d"; done
+    fi
+    # Fall back to the default if nothing valid was given.
+    if [[ ${#MOUNT_SPECS[@]} -eq 0 ]]; then
+        add_mount_spec "$DEFAULT_MOUNT_DIRS"
+    fi
+}
+
+# Split a canonical "src:dest" spec into _MOUNT_SRC / _MOUNT_DEST on the first
+# colon (paths containing ':' are not supported, as with podman -v).
+parse_mount_spec() {
+    _MOUNT_SRC="${1%%:*}"
+    _MOUNT_DEST="${1#*:}"
+}
+
+# Display form — collapse a "src:src" spec back to a bare path.
+format_mount() {
+    parse_mount_spec "$1"
+    if [[ "$_MOUNT_SRC" == "$_MOUNT_DEST" ]]; then
+        printf '%s' "$_MOUNT_SRC"
+    else
+        printf '%s:%s' "$_MOUNT_SRC" "$_MOUNT_DEST"
+    fi
+}
+
+# Resolve the on/off modes by precedence: an explicit CLI flag (including the
+# --no-* negations) > config file > off. For the mutually exclusive
+# privileged/isolated pair, an explicit CLI choice of one suppresses the other
+# inherited from the config file.
+resolve_modes() {
+    if [[ -n "$cli_ai_agents" ]]; then copy_ai_agents="$cli_ai_agents"
+    else copy_ai_agents="${config_ai_agents:-false}"; fi
+
+    if [[ -n "$cli_assumeyes" ]]; then assume_yes="$cli_assumeyes"
+    else assume_yes="${config_assumeyes:-false}"; fi
+
+    # Both chosen explicitly on the CLI is contradictory.
+    if [[ "$cli_privileged" == true && "$cli_isolated" == true ]]; then
+        echo "Error: --privileged and --isolated are mutually exclusive"
+        exit 1
+    fi
+
+    if [[ -n "$cli_isolated" ]]; then
+        isolated="$cli_isolated"
+    elif [[ "$cli_privileged" == true ]]; then
+        isolated=false                    # CLI chose privileged → not isolated
+    else
+        isolated="${config_isolated:-false}"
+    fi
+
+    if [[ -n "$cli_privileged" ]]; then
+        privileged="$cli_privileged"
+    elif [[ "$cli_isolated" == true ]]; then
+        privileged=false                  # CLI chose isolated → not privileged
+    else
+        privileged="${config_privileged:-false}"
+    fi
+
+    # Catch a config file that enables both.
+    if [[ "$privileged" == true && "$isolated" == true ]]; then
+        echo "Error: privileged and isolated are mutually exclusive (check $CONFIG_FILE)"
+        exit 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -116,11 +330,14 @@ Commands:
   stop   [CONTAINER]      Stop the container
   rm     [CONTAINER...]   Remove the container(s)
   rmi    <IMAGE...>       Remove toolboxer image(s)
+  config                  Show the effective configuration (config file + flags)
   help                    Show this help
 
 Global options (must come before the command):
-  -m, --mount DIR         Mount DIR (read-write) into the container. Repeat the
-                          flag once per directory. This replaces the default
+  -m, --mount SPEC        Mount a directory (read-write) into the container.
+                          SPEC is DIR (mounted at the same path) or SRC:DEST
+                          (mounted at a custom target), like podman -v. Repeat
+                          the flag once per mount. This replaces the default
                           mount ($DEFAULT_MOUNT_DIRS) rather than adding to it.
   -A, --ai-agents         Also mount the config of any AI agent CLIs found in
                           your home (Claude Code, Codex, Gemini, Aider, …) so
@@ -133,24 +350,41 @@ Global options (must come before the command):
                           untrusted code. Incompatible with --privileged.
   -h, --help              Show this help
 
+  Each of -A/-y/--privileged/--isolated has a --no-... form (--no-ai-agents,
+  --no-assumeyes, --no-privileged, --no-isolated) to switch it off for one run
+  when it is enabled by default in the config file.
+
 Each command has its own options too — see '$prog <command> --help'.
 
 Mounting additional directories:
   By default only $DEFAULT_MOUNT_DIRS is mounted. Pass -m/--mount once per
   directory you want available inside the container (the first one becomes the
-  working directory on 'enter'):
+  working directory on 'enter'). Each mount is DIR or SRC:DEST (a custom target
+  path inside the container, like podman -v):
 
     $prog -m ~/code -m ~/documents create
-    $prog create -m ~/code -m ~/work/project   # 'create' accepts -m directly too
+    $prog create -m ~/code -m ~/work/project:/project   # custom target path
 
-  Or set MOUNT_DIRS to a colon-separated list (CLI flags override it):
+  Or set MOUNT_DIRS to a comma-separated list (CLI flags override it):
 
-    MOUNT_DIRS=~/code:~/documents $prog create
+    MOUNT_DIRS=~/code,~/documents:/docs $prog create
 
-Environment variables (lowest priority — CLI flags override these):
+Environment variables (override the config file, but not CLI flags):
   CONTAINER_NAME          Default container name
   IMAGE                   Image to use (e.g. fedora:41)
-  MOUNT_DIRS              Colon-separated list of directories to mount
+  MOUNT_DIRS              Comma-separated list of mounts (DIR or SRC:DEST each)
+
+Configuration file (lowest priority — env vars and CLI flags override it):
+  Set defaults in a "key = value" file at \$TOOLBOXER_CONFIG, else
+  \${XDG_CONFIG_HOME:-~/.config}/toolboxer/config. Keys (all optional):
+  mount (DIR or SRC:DEST; repeatable or comma-separated), ai_agents, assumeyes,
+  privileged, isolated, image, distro, release, container_name, authfile.
+  Booleans take true/false. '#' starts a comment. Example:
+
+    mount = ~/code
+    mount = ~/data:/data
+    ai_agents = true
+    privileged = true
 
 Examples:
   $prog                                # enter the default container
@@ -182,9 +416,10 @@ Options:
                         (default: host release, $HOST_VERSION_ID; incompatible with --image)
   -i, --image NAME      Use a custom image (incompatible with --distro/--release)
       --authfile FILE   Registry credentials file for pulling the image
-  -m, --mount DIR       Mount DIR (read-write); repeat once per directory.
+  -m, --mount SPEC      Mount a directory (read-write); SPEC is DIR or SRC:DEST
+                        (custom target, like podman -v). Repeat once per mount.
                         Replaces the default mount ($DEFAULT_MOUNT_DIRS).
-                        The first mounted directory becomes the working directory.
+                        The first mount's target becomes the working directory.
   -A, --ai-agents       Also mount the config/data dirs of AI agent CLIs found
                         in your home (Claude Code, Codex, Gemini, Aider, Goose,
                         OpenCode, …) at the same paths, so they run inside the
@@ -198,6 +433,9 @@ Options:
                         (no GUI, host DNS, or nested podman). For untrusted
                         code. Incompatible with --privileged.
   -h, --help            Show this help
+
+  -A/--privileged/--isolated each have a --no-... form (--no-ai-agents,
+  --no-privileged, --no-isolated) to switch off a config-file default.
 
 Examples:
   $prog create
@@ -342,11 +580,32 @@ EOF
     exit "${1:-1}"
 }
 
+usage_config() {
+    cat <<EOF
+Usage: $prog config
+
+Show the effective configuration: the config file location and the settings as
+resolved from defaults, the config file, environment variables, and any global
+flags given before 'config'. Read-only — it changes nothing.
+
+Examples:
+  $prog config
+  $prog --privileged config       # preview with a flag applied
+EOF
+    exit "${1:-1}"
+}
+
 # ---------------------------------------------------------------------------
 # Parse global options (only -m/--mount and -h/--help before the command)
 # ---------------------------------------------------------------------------
 
 cli_mounts=()
+# Tri-state: "" = not given on the CLI (fall back to the config file), else the
+# explicit choice. resolve_modes turns these into the final booleans below.
+cli_ai_agents=""
+cli_assumeyes=""
+cli_privileged=""
+cli_isolated=""
 copy_ai_agents=false
 assume_yes=false
 privileged=false
@@ -354,44 +613,39 @@ isolated=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -m|--mount)     cli_mounts+=("$2");  shift 2 ;;
-        -A|--ai-agents) copy_ai_agents=true; shift ;;
-        -y|--assumeyes) assume_yes=true;     shift ;;
-        --privileged)   privileged=true;     shift ;;
-        --isolated)     isolated=true;       shift ;;
-        -h|--help)      usage 0 ;;
-        -*)             echo "Unknown option: $1"; usage ;;
-        *)              break ;;
+        -m|--mount)       cli_mounts+=("$2");   shift 2 ;;
+        -A|--ai-agents)   cli_ai_agents=true;   shift ;;
+        --no-ai-agents)   cli_ai_agents=false;  shift ;;
+        -y|--assumeyes)   cli_assumeyes=true;   shift ;;
+        --no-assumeyes)   cli_assumeyes=false;  shift ;;
+        --privileged)     cli_privileged=true;  shift ;;
+        --no-privileged)  cli_privileged=false; shift ;;
+        --isolated)       cli_isolated=true;    shift ;;
+        --no-isolated)    cli_isolated=false;   shift ;;
+        -h|--help)        usage 0 ;;
+        -*)               echo "Unknown option: $1"; usage ;;
+        *)                break ;;
     esac
 done
 
-if [[ ${#cli_mounts[@]} -gt 0 ]]; then
-    MOUNT_DIRS=""
-    for d in "${cli_mounts[@]}"; do
-        MOUNT_DIRS="${MOUNT_DIRS:+$MOUNT_DIRS:}$d"
-    done
-fi
+resolve_modes
+resolve_mount_dirs
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-read_mount_dirs() {
-    local IFS=":"
-    read -ra _MOUNT_ARRAY <<< "$MOUNT_DIRS"
-}
-
 build_volume_args() {
     local relabel="${1:-}"   # SELinux relabel suffix ("z"), or empty
-    read_mount_dirs
-    local args=() opt=""
+    local args=() opt="" spec
     [[ -n "$relabel" ]] && opt=":$relabel"
-    for d in "${_MOUNT_ARRAY[@]}"; do
-        mkdir -p "$d"
+    for spec in "${MOUNT_SPECS[@]}"; do
+        parse_mount_spec "$spec"
+        mkdir -p "$_MOUNT_SRC"
         # By default no SELinux relabel: the container runs with label=disable,
         # so :z would be pointless and fails on any file in the mount owned by
         # another user. --isolated runs confined and passes "z" to relabel.
-        args+=(--volume "$d:$d$opt")
+        args+=(--volume "$_MOUNT_SRC:$_MOUNT_DEST$opt")
     done
     printf '%s\n' "${args[@]}"
 }
@@ -509,8 +763,9 @@ found_ai_agents() {
 }
 
 default_workdir() {
-    read_mount_dirs
-    echo "${_MOUNT_ARRAY[0]}"
+    # workdir = where the first mount lands (its dest).
+    parse_mount_spec "${MOUNT_SPECS[0]}"
+    echo "$_MOUNT_DEST"
 }
 
 setup_user_in_container() {
@@ -654,22 +909,39 @@ fi
 
 case "$cmd" in
     create)
+        # Track which of image/distro/release the user gave on the CLI, so a CLI
+        # choice can override the incompatible one when it only came from config.
+        cli_image_set=false
+        cli_distro_set=false
+        cli_release_set=false
         # Parse create-specific flags
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--distro)  DISTRO="$2";  shift 2 ;;
-                -i|--image)   IMAGE="$2";   shift 2 ;;
-                -r|--release) RELEASE="$2"; shift 2 ;;
-                -m|--mount)   cli_mounts+=("$2"); shift 2 ;;
-                -A|--ai-agents) copy_ai_agents=true; shift ;;
-                --authfile)   AUTHFILE="$2"; shift 2 ;;
-                --privileged) privileged=true; shift ;;
-                --isolated)   isolated=true; shift ;;
-                -h|--help)    usage_create 0 ;;
-                -*)           echo "Unknown create option: $1"; usage_create ;;
-                *)            CONTAINER_NAME="$1"; shift ;;
+                -d|--distro)      DISTRO="$2";  cli_distro_set=true;  shift 2 ;;
+                -i|--image)       IMAGE="$2";   cli_image_set=true;   shift 2 ;;
+                -r|--release)     RELEASE="$2"; cli_release_set=true; shift 2 ;;
+                -m|--mount)       cli_mounts+=("$2");   shift 2 ;;
+                -A|--ai-agents)   cli_ai_agents=true;   shift ;;
+                --no-ai-agents)   cli_ai_agents=false;  shift ;;
+                --authfile)       AUTHFILE="$2"; shift 2 ;;
+                --privileged)     cli_privileged=true;  shift ;;
+                --no-privileged)  cli_privileged=false; shift ;;
+                --isolated)       cli_isolated=true;    shift ;;
+                --no-isolated)    cli_isolated=false;   shift ;;
+                -h|--help)        usage_create 0 ;;
+                -*)               echo "Unknown create option: $1"; usage_create ;;
+                *)                CONTAINER_NAME="$1"; shift ;;
             esac
         done
+
+        # A CLI --image overrides a distro/release that only came from the config
+        # file (and vice versa) — the two cannot be combined.
+        if [[ "$cli_image_set" == true ]]; then
+            [[ "$cli_distro_set" == false ]] && DISTRO=""
+            [[ "$cli_release_set" == false ]] && RELEASE=""
+        elif [[ "$cli_distro_set" == true || "$cli_release_set" == true ]]; then
+            IMAGE=""
+        fi
 
         # --image is incompatible with --distro/--release
         if [[ -n "$IMAGE" && ( -n "$DISTRO" || -n "$RELEASE" ) ]]; then
@@ -677,19 +949,10 @@ case "$cmd" in
             exit 1
         fi
 
-        # --privileged loosens isolation; --isolated tightens it — contradictory.
-        if [[ "$privileged" == true && "$isolated" == true ]]; then
-            echo "Error: --privileged and --isolated are mutually exclusive"
-            exit 1
-        fi
-
-        # Re-process mounts if any were added in subcommand parsing
-        if [[ ${#cli_mounts[@]} -gt 0 ]]; then
-            MOUNT_DIRS=""
-            for d in "${cli_mounts[@]}"; do
-                MOUNT_DIRS="${MOUNT_DIRS:+$MOUNT_DIRS:}$d"
-            done
-        fi
+        # Re-resolve modes/mounts now that create's own flags are parsed.
+        # (resolve_modes also rejects a privileged+isolated combination.)
+        resolve_modes
+        resolve_mount_dirs
 
         finalize_names
 
@@ -699,10 +962,11 @@ case "$cmd" in
             exit 1
         fi
 
-        read_mount_dirs
+        mount_display=()
+        for spec in "${MOUNT_SPECS[@]}"; do mount_display+=("$(format_mount "$spec")"); done
         echo "Creating restricted toolbox '$CONTAINER_NAME'"
         echo "Image: $IMAGE"
-        echo "Mounting: ${_MOUNT_ARRAY[*]}"
+        echo "Mounting: ${mount_display[*]}"
 
         # Assemble the create flags by mode.
         #
@@ -795,9 +1059,21 @@ case "$cmd" in
                 for d in "${cli_mounts[@]}"; do
                     reinvoke_args+=(-m "$d")
                 done
-                [[ "$copy_ai_agents" == true ]] && reinvoke_args+=(--ai-agents)
-                [[ "$privileged" == true ]] && reinvoke_args+=(--privileged)
-                [[ "$isolated" == true ]] && reinvoke_args+=(--isolated)
+                # Pass each mode explicitly (including the --no-* forms) so the
+                # re-invoked 'create' — which re-reads the config file — cannot
+                # derive a different value than we resolved here.
+                if [[ "$copy_ai_agents" == true ]]; then
+                    reinvoke_args+=(--ai-agents)
+                else
+                    reinvoke_args+=(--no-ai-agents)
+                fi
+                if [[ "$isolated" == true ]]; then
+                    reinvoke_args+=(--isolated)
+                elif [[ "$privileged" == true ]]; then
+                    reinvoke_args+=(--privileged)
+                else
+                    reinvoke_args+=(--no-privileged --no-isolated)
+                fi
                 reinvoke_args+=(create)
                 [[ -n "$DISTRO" ]] && reinvoke_args+=(--distro "$DISTRO")
                 [[ -n "$RELEASE" ]] && reinvoke_args+=(--release "$RELEASE")
@@ -1009,6 +1285,48 @@ case "$cmd" in
             echo "Error: Specify image name(s) or use --all"
             exit 1
         fi
+        ;;
+
+    config)
+        # Show the effective configuration. Read-only — resolves nothing on the
+        # host, just reports how settings combined from defaults, the config
+        # file, env vars, and any global flags before 'config'.
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -h|--help)    usage_config 0 ;;
+                -*)           echo "Unknown config option: $1"; usage_config ;;
+                *)            echo "Unknown config argument: $1"; usage_config ;;
+            esac
+        done
+
+        finalize_names
+        mount_display=()
+        for spec in "${MOUNT_SPECS[@]}"; do mount_display+=("$(format_mount "$spec")"); done
+
+        if [[ -f "$CONFIG_FILE" ]]; then
+            echo "Config file: $CONFIG_FILE (loaded)"
+        else
+            echo "Config file: $CONFIG_FILE (not found)"
+        fi
+        echo "Effective settings (config file < env vars < CLI flags):"
+        printf '  %-11s %s\n' "mount"      "${mount_display[*]}"
+        printf '  %-11s %s\n' "ai_agents"  "$copy_ai_agents"
+        printf '  %-11s %s\n' "assumeyes"  "$assume_yes"
+        printf '  %-11s %s\n' "privileged" "$privileged"
+        printf '  %-11s %s\n' "isolated"   "$isolated"
+        printf '  %-11s %s\n' "image"      "$IMAGE"
+        printf '  %-11s %s\n' "container"  "$CONTAINER_NAME"
+        if [[ -n "$DISTRO" ]]; then
+            printf '  %-11s %s\n' "distro"  "$DISTRO"
+        else
+            printf '  %-11s %s\n' "distro"  "$HOST_ID (host default)"
+        fi
+        if [[ -n "$RELEASE" ]]; then
+            printf '  %-11s %s\n' "release" "$RELEASE"
+        else
+            printf '  %-11s %s\n' "release" "$HOST_VERSION_ID (host default)"
+        fi
+        printf '  %-11s %s\n' "authfile"   "${AUTHFILE:-(none)}"
         ;;
 
     help)

@@ -14,7 +14,8 @@ A motivating use case is **running AI coding agents without trusting them with y
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
 - **Nested podman** — with `--privileged`, rootless podman-in-podman works inside the container, no host devices required (see [Running podman inside the container](#running-podman-inside-the-container)).
 - **AI agents** — `--ai-agents` shares the config of AI agent CLIs (Claude Code, Codex, Gemini, Aider, …) from your home into the container so they run with your existing login.
-- **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
+- **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (comma-separated). Each mount is `DIR` or `SRC:DEST` to land it at a custom path inside the container, like `podman -v`.
+- **Configuration file** — set persistent defaults (mounts, `--ai-agents`, `--privileged`, …) in `~/.config/toolboxer/config` instead of repeating flags (see [Configuration file](#configuration-file)).
 - **toolbox-compatible CLI** — implements every user-facing `toolbox` command (`create`, `enter`, `run`, `list`, `rm`, `rmi`, `help`) and their flags, so existing `toolbox` invocations work unchanged (see [Compatibility with toolbox](#compatibility-with-toolbox)).
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
 - **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically.
@@ -117,6 +118,7 @@ Running `toolboxer` with no command defaults to `enter`.
 | `stop` | Stop the container |
 | `rm` | Remove the container(s) |
 | `rmi` | Remove toolbox image(s) |
+| `config` | Show the effective configuration (config file + flags) |
 | `help` | Show help |
 
 ### `create` options
@@ -126,11 +128,13 @@ Running `toolboxer` with no command defaults to `enter`.
 | `-d`, `--distro DISTRO` | Use a different distro (incompatible with `--image`) |
 | `-i`, `--image NAME` | Use a custom image (incompatible with `--distro`/`--release`) |
 | `-r`, `--release RELEASE` | Use a different release (incompatible with `--image`) |
-| `-m`, `--mount DIR` | Directory to mount (repeatable) |
+| `-m`, `--mount SPEC` | Mount `DIR`, or `SRC:DEST` for a custom target (repeatable) |
 | `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
 | `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
 | `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)); incompatible with `--privileged` |
 | `[CONTAINER]` | Container name (positional) |
+
+`-A`/`--privileged`/`--isolated` each have a `--no-…` form (`--no-ai-agents`, `--no-privileged`, `--no-isolated`) to switch off a default set in the [config file](#configuration-file).
 
 ### `enter` options
 
@@ -179,22 +183,66 @@ With no name, `rm` (like `enter`/`run`/`stop`) resolves the container from `-d`/
 
 | Option | Description |
 |--------|-------------|
-| `-m`, `--mount DIR` | Directory to mount — repeatable (default: `~/code`) |
+| `-m`, `--mount SPEC` | Mount `DIR`, or `SRC:DEST` for a custom target — repeatable (default: `~/code`) |
 | `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
 | `-y`, `--assumeyes` | Assume yes to prompts (e.g. auto-create on `enter`) |
 | `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
 | `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)) |
 | `-h`, `--help` | Show help |
 
+Each on/off global has a `--no-…` form (`--no-ai-agents`, `--no-assumeyes`, `--no-privileged`, `--no-isolated`) to override a default enabled in the [config file](#configuration-file).
+
 ### Environment variables
 
-These are the lowest priority — CLI flags override them.
+These override the config file but are themselves overridden by CLI flags.
 
 | Variable | Description |
 |----------|-------------|
 | `CONTAINER_NAME` | Container name |
 | `IMAGE` | Image to use |
-| `MOUNT_DIRS` | Colon-separated list of directories to mount |
+| `MOUNT_DIRS` | Comma-separated list of mounts (`DIR` or `SRC:DEST` each) |
+
+### Configuration file
+
+Persistent defaults live in a simple `key = value` file, so you don't have to repeat flags on every invocation. Settings resolve by precedence:
+
+```
+CLI flags  >  environment variables  >  config file  >  built-in defaults
+```
+
+The file is read from `$TOOLBOXER_CONFIG`, else `$XDG_CONFIG_HOME/toolboxer/config`, else `~/.config/toolboxer/config`. Lines are `key = value` (or `key value`); `#` starts a comment; blank lines are ignored.
+
+```ini
+# ~/.config/toolboxer/config
+mount      = ~/code          # repeat the line, or comma-separate, for several
+mount      = ~/data:/data    # SRC:DEST mounts at a custom target path
+ai_agents  = true            # mount AI agent logins by default (-A)
+privileged = true            # run privileged by default
+```
+
+| Key | Type | Equivalent flag |
+|-----|------|-----------------|
+| `mount` | `DIR` or `SRC:DEST` (repeatable / comma-separated) | `-m`/`--mount` |
+| `ai_agents` | bool | `-A`/`--ai-agents` |
+| `assumeyes` | bool | `-y`/`--assumeyes` |
+| `privileged` | bool | `--privileged` |
+| `isolated` | bool | `--isolated` |
+| `image` | string | `-i`/`--image` |
+| `distro` | string | `-d`/`--distro` |
+| `release` | string | `-r`/`--release` |
+| `container_name` | string | `CONTAINER_NAME` |
+| `authfile` | path | `--authfile` |
+
+Booleans accept `true`/`false` (also `yes`/`no`, `on`/`off`, `1`/`0`). A value set in the config file can be turned off for a single run with the matching `--no-…` flag (e.g. `--no-privileged`). Run `toolboxer config` to see exactly how the settings resolved:
+
+```bash
+$ toolboxer config
+Config file: /home/you/.config/toolboxer/config (loaded)
+Effective settings (config file < env vars < CLI flags):
+  mount       /home/you/code
+  ai_agents   true
+  ...
+```
 
 ### Examples
 
@@ -235,6 +283,9 @@ toolboxer list
 
 # List only containers (no images)
 toolboxer list --containers
+
+# Show how settings resolve (config file < env vars < CLI flags)
+toolboxer config
 
 # Stop and remove
 toolboxer stop
@@ -414,6 +465,7 @@ unchanged. It also adds extras of its own.
 | `help` | ✅ | |
 | `init-container` | n/a | Internal `toolbox` container entrypoint, never run by users; toolboxer sets the user up via `useradd`/sudoers on first start instead. |
 | — | `stop` | toolboxer extra |
+| — | `config` | toolboxer extra — show the effective configuration |
 
 ### Flags
 
@@ -426,7 +478,9 @@ and `--log-podman`. toolboxer is a Bash script, so run it with `bash -x` for
 tracing instead.
 
 **toolboxer extras:** global `-m`/`--mount`, `-A`/`--ai-agents`, `--privileged`
-and `--isolated`; `-d`/`-r` on `rm` and `stop`; and the `stop` command.
+and `--isolated` (each with a `--no-…` form); `-d`/`-r` on `rm` and `stop`; the
+`stop` and `config` commands; and a [config file](#configuration-file) for
+persistent defaults.
 
 ## How it differs from toolbox
 
