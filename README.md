@@ -4,7 +4,7 @@
 
 A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/) command, written in Bash. It creates Podman containers for development work but restricts volume mounts to only the directories you specify, rather than exposing your entire home directory.
 
-A motivating use case is **running AI coding agents without trusting them with your whole machine**. By default the container can only see the directories you mount (just `~/code`) — not the rest of your home, your SSH keys, or the wider filesystem — so an agent can work on your code without access to anything outside it. The `--ai-agents` flag then shares just each agent's own config so it runs with your existing login (see [AI agents](#ai-agents)).
+A motivating use case is **running AI coding agents without trusting them with your whole machine**. By default the container can only see the directories you mount (just `~/code`) — not the rest of your home, your SSH keys, or the wider filesystem — so an agent can work on your code without access to anything outside it. The `--ai-agents` flag then shares just each agent's own config so it runs with your existing login, and `--isolated` tightens the container further for untrusted code (see [Security model](#security-model) and [AI agents](#ai-agents)).
 
 ## Features
 
@@ -12,7 +12,7 @@ A motivating use case is **running AI coding agents without trusting them with y
 - **Full host integration** — X11, Wayland, D-Bus, SSH agent, PulseAudio, and XDG runtime dir are all passed through via discrete socket mounts.
 - **User environment** — a matching user account with sudo access is created inside the container, with your UID/GID preserved.
 - **Config sync** — `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only.
-- **Nested podman** — rootless podman-in-podman works out of the box, with no required host devices (see [Running podman inside the container](#running-podman-inside-the-container)).
+- **Nested podman** — with `--privileged`, rootless podman-in-podman works inside the container, no host devices required (see [Running podman inside the container](#running-podman-inside-the-container)).
 - **AI agents** — `--ai-agents` shares the config of AI agent CLIs (Claude Code, Codex, Gemini, Aider, …) from your home into the container so they run with your existing login.
 - **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (colon-separated).
 - **toolbox-compatible CLI** — implements every user-facing `toolbox` command (`create`, `enter`, `run`, `list`, `rm`, `rmi`, `help`) and their flags, so existing `toolbox` invocations work unchanged (see [Compatibility with toolbox](#compatibility-with-toolbox)).
@@ -128,6 +128,8 @@ Running `toolboxer` with no command defaults to `enter`.
 | `-r`, `--release RELEASE` | Use a different release (incompatible with `--image`) |
 | `-m`, `--mount DIR` | Directory to mount (repeatable) |
 | `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
+| `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
+| `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)); incompatible with `--privileged` |
 | `[CONTAINER]` | Container name (positional) |
 
 ### `enter` options
@@ -179,6 +181,9 @@ With no name, `rm` (like `enter`/`run`/`stop`) resolves the container from `-d`/
 |--------|-------------|
 | `-m`, `--mount DIR` | Directory to mount — repeatable (default: `~/code`) |
 | `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
+| `-y`, `--assumeyes` | Assume yes to prompts (e.g. auto-create on `enter`) |
+| `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
+| `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)) |
 | `-h`, `--help` | Show help |
 
 ### Environment variables
@@ -264,14 +269,16 @@ Environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`,
 
 ## Running podman inside the container
 
-Rootless **podman-in-podman** works out of the box, with **no required host
-devices**:
+Create the container with `--privileged` and rootless **podman-in-podman** works
+inside it, with **no required host devices**:
 
 ```bash
+toolboxer create --privileged
 toolboxer run podman run hello-world
 ```
 
-This is achieved with the fewest possible host requirements:
+`--privileged` reduces isolation (see [Security model](#security-model)), so
+it's opt-in. With it, the setup needs the fewest possible host requirements:
 
 - **Networking** — on first start, toolboxer drops a containers.conf drop-in
   (`/etc/containers/containers.conf.d/90-toolboxer-nested.conf`) that defaults
@@ -281,18 +288,18 @@ This is achieved with the fewest possible host requirements:
   kernel module). Override per-container with `podman run --network pasta …` if
   you have `/dev/net/tun` available.
 - **Storage** — on a modern kernel, the nested podman uses native rootless
-  overlay, so `/dev/fuse` isn't required. `/dev/fuse` and `/dev/net/tun` are
-  still passed through *when present* on the host (harmless), which lets
-  fuse-overlayfs and bridged/pasta networking work if you opt back into them.
-- **Capabilities** — the toolbox is created `--privileged`. In *rootless*
-  podman this grants no real host privilege (the container stays confined to
-  your rootless user namespace); it just gives the container the capabilities
-  you already have and unmasks `/proc`. Without it, the nested podman — which
-  falls back to single-UID mapping here (no subuid ranges) and so inherits
-  toolboxer's capped-down set — fails privileged-in-userns operations such as
-  mounting a fresh `procfs` (`crun: mount proc: Operation not permitted`) and
-  `sethostname` (`crun: sethostname: Operation not permitted`). This is the
-  same approach [distrobox](https://github.com/89luca89/distrobox) takes.
+  overlay, so `/dev/fuse` isn't required. `--privileged` also exposes the host
+  devices (including `/dev/fuse` and `/dev/net/tun`), so fuse-overlayfs and
+  bridged/pasta networking work if you opt back into them.
+- **Capabilities** — `--privileged` is what makes nested podman work. In
+  *rootless* podman it grants no real host privilege (the container stays
+  confined to your rootless user namespace); it just gives the container the
+  capabilities you already have and unmasks `/proc`. Without it, the nested
+  podman — which falls back to single-UID mapping here (no subuid ranges) and
+  so inherits toolboxer's capped-down set — fails privileged-in-userns
+  operations such as mounting a fresh `procfs` (`crun: mount proc: Operation
+  not permitted`) and `sethostname`. This is the same approach
+  [distrobox](https://github.com/89luca89/distrobox) takes.
 - **Runtime isolation** — toolboxer bind-mounts your `$XDG_RUNTIME_DIR` (for
   the Wayland/PulseAudio/D-Bus sockets), but shadows podman's own state dirs
   inside it (`$XDG_RUNTIME_DIR/containers` and `.../libpod`) with empty
@@ -335,6 +342,42 @@ OpenAI Codex (`~/.codex`), Gemini CLI (`~/.gemini`), Qwen Code, Cursor, Grok,
 Continue, GitHub Copilot CLI, Goose, OpenCode, Crush, Aider, `llm`, Shell-GPT,
 and Open Interpreter. The list lives in `AI_AGENT_PATHS` near the top of the
 `toolboxer` script — add new agents there.
+
+## Security model
+
+toolboxer's main protection is the **mount boundary**: a container can only see
+the directories you mount into it. Your home, SSH keys, and the rest of the
+filesystem aren't mounted, so they're simply absent from the container — and
+**this holds in every mode**. It's what makes the tool useful for running an AI
+agent on your code without exposing the rest of your machine.
+
+What the default container does *not* do is harden against a malicious process
+trying to **break out**. Like `toolbox`, it runs with SELinux disabled for the
+container (`--security-opt label=disable`, which is required so it can read host
+files like `/etc/resolv.conf` and the X11/D-Bus/SSH sockets) and shares the host
+network, PID, and IPC namespaces. That's fine for your own code; it is not an
+escape-proof sandbox.
+
+Two flags adjust the trade-off (they are mutually exclusive):
+
+| | default | `--privileged` | `--isolated` |
+|-|---------|----------------|--------------|
+| Files visible | only your mounts | only your mounts | only your mounts |
+| SELinux | off for container | off for container | **confined** |
+| Namespaces | host net/pid/ipc | host net/pid/ipc | **private** |
+| Host integration (GUI, DNS, sockets) | yes | yes | **no** |
+| `--privileged` | no | **yes** | no |
+| Internet access | yes | yes | yes (podman netns) |
+| Nested podman/docker | no | **yes** | no |
+
+- **`--privileged`** *loosens* isolation, and only exists to run podman/docker
+  inside the container. Don't use it for code you don't trust.
+- **`--isolated`** *tightens* it: SELinux-confined, private namespaces, no host
+  integration, and only your (relabeled) mounts — the right choice for running
+  something untrusted. It still reaches the internet via podman's own
+  networking, so an agent's API calls work, but there's no GUI, host DNS, or
+  nested podman. Note `:z` relabeling fails on files in the mount owned by
+  another user, so the mounted tree must be yours.
 
 ## Testing
 
@@ -382,8 +425,8 @@ All `toolbox` per-command flags are implemented — `create` (`-d`/`-i`/`-r`/`--
 and `--log-podman`. toolboxer is a Bash script, so run it with `bash -x` for
 tracing instead.
 
-**toolboxer extras:** global `-m`/`--mount` and `-A`/`--ai-agents`; `-d`/`-r` on
-`rm` and `stop`; and the `stop` command.
+**toolboxer extras:** global `-m`/`--mount`, `-A`/`--ai-agents`, `--privileged`
+and `--isolated`; `-d`/`-r` on `rm` and `stop`; and the `stop` command.
 
 ## How it differs from toolbox
 

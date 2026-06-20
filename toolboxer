@@ -126,6 +126,11 @@ Global options (must come before the command):
                           your home (Claude Code, Codex, Gemini, Aider, …) so
                           they run inside the container with your host login.
   -y, --assumeyes         Assume yes to prompts (e.g. auto-create on 'enter').
+      --privileged        Run the container privileged (needed to run podman or
+                          docker inside it). Reduces isolation; off by default.
+      --isolated          Hardened sandbox: SELinux-confined, only your mounts,
+                          private namespaces, no host integration — for running
+                          untrusted code. Incompatible with --privileged.
   -h, --help              Show this help
 
 Each command has its own options too — see '$prog <command> --help'.
@@ -186,6 +191,12 @@ Options:
                         container using your existing host login/sessions. Only
                         dirs that exist are mounted; the agent CLI itself must
                         be installed in the container.
+      --privileged      Run the container privileged (needed to run podman or
+                        docker inside it). Reduces isolation; off by default.
+      --isolated        Hardened sandbox: SELinux-confined, only your mounts
+                        (relabeled), private namespaces, no host integration
+                        (no GUI, host DNS, or nested podman). For untrusted
+                        code. Incompatible with --privileged.
   -h, --help            Show this help
 
 Examples:
@@ -338,12 +349,16 @@ EOF
 cli_mounts=()
 copy_ai_agents=false
 assume_yes=false
+privileged=false
+isolated=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -m|--mount)     cli_mounts+=("$2");  shift 2 ;;
         -A|--ai-agents) copy_ai_agents=true; shift ;;
         -y|--assumeyes) assume_yes=true;     shift ;;
+        --privileged)   privileged=true;     shift ;;
+        --isolated)     isolated=true;       shift ;;
         -h|--help)      usage 0 ;;
         -*)             echo "Unknown option: $1"; usage ;;
         *)              break ;;
@@ -367,14 +382,16 @@ read_mount_dirs() {
 }
 
 build_volume_args() {
+    local relabel="${1:-}"   # SELinux relabel suffix ("z"), or empty
     read_mount_dirs
-    local args=()
+    local args=() opt=""
+    [[ -n "$relabel" ]] && opt=":$relabel"
     for d in "${_MOUNT_ARRAY[@]}"; do
         mkdir -p "$d"
-        # No SELinux relabel (:z): the container runs with label=disable, so a
-        # relabel is pointless, and it fails on any file in the mount owned by
-        # another user (e.g. root-owned files left by a nested container).
-        args+=(--volume "$d:$d")
+        # By default no SELinux relabel: the container runs with label=disable,
+        # so :z would be pointless and fails on any file in the mount owned by
+        # another user. --isolated runs confined and passes "z" to relabel.
+        args+=(--volume "$d:$d$opt")
     done
     printf '%s\n' "${args[@]}"
 }
@@ -450,22 +467,6 @@ build_env_args() {
     printf '%s\n' "${args[@]}"
 }
 
-# Pass /dev/fuse and /dev/net/tun through for nested rootless podman, but only
-# when present so hosts without them still create cleanly.
-build_device_args() {
-    local args=()
-    local -a nested_devices=(
-        /dev/fuse
-        /dev/net/tun
-    )
-    for dev in "${nested_devices[@]}"; do
-        [[ -e "$dev" ]] && args+=(--device "$dev")
-    done
-    # Emit nothing when empty — a blank line would become a spurious empty
-    # argument to `podman create`.
-    [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
-}
-
 # Home-relative config/data paths for popular AI agent CLIs. With --ai-agents,
 # any that exist on the host are bind-mounted into the container at the same
 # path (see README). Missing paths are skipped, so extra candidates are safe.
@@ -488,12 +489,12 @@ AI_AGENT_PATHS=(
 )
 
 build_ai_agent_args() {
-    local args=() p
+    local relabel="${1:-}"   # SELinux relabel suffix ("z"), or empty
+    local args=() p opt=""
+    [[ -n "$relabel" ]] && opt=":$relabel"
     for p in "${AI_AGENT_PATHS[@]}"; do
-        # No SELinux relabel (:z): the container already runs with
-        # `label=disable`, so relabeling the user's real config dirs is both
-        # unnecessary and undesirable.
-        [[ -e "$HOME/$p" ]] && args+=(--volume "$HOME/$p:$HOME/$p")
+        # No SELinux relabel by default (label=disable); --isolated passes "z".
+        [[ -e "$HOME/$p" ]] && args+=(--volume "$HOME/$p:$HOME/$p$opt")
     done
     [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
 }
@@ -662,6 +663,8 @@ case "$cmd" in
                 -m|--mount)   cli_mounts+=("$2"); shift 2 ;;
                 -A|--ai-agents) copy_ai_agents=true; shift ;;
                 --authfile)   AUTHFILE="$2"; shift 2 ;;
+                --privileged) privileged=true; shift ;;
+                --isolated)   isolated=true; shift ;;
                 -h|--help)    usage_create 0 ;;
                 -*)           echo "Unknown create option: $1"; usage_create ;;
                 *)            CONTAINER_NAME="$1"; shift ;;
@@ -671,6 +674,12 @@ case "$cmd" in
         # --image is incompatible with --distro/--release
         if [[ -n "$IMAGE" && ( -n "$DISTRO" || -n "$RELEASE" ) ]]; then
             echo "Error: --image is incompatible with --distro and --release"
+            exit 1
+        fi
+
+        # --privileged loosens isolation; --isolated tightens it — contradictory.
+        if [[ "$privileged" == true && "$isolated" == true ]]; then
+            echo "Error: --privileged and --isolated are mutually exclusive"
             exit 1
         fi
 
@@ -695,14 +704,37 @@ case "$cmd" in
         echo "Image: $IMAGE"
         echo "Mounting: ${_MOUNT_ARRAY[*]}"
 
-        mapfile -t vol_args < <(build_volume_args)
-        mapfile -t host_args < <(build_host_integration_args)
-        mapfile -t env_args < <(build_env_args)
-        mapfile -t device_args < <(build_device_args)
+        # Assemble the create flags by mode.
+        #
+        # default: toolbox-style — SELinux off for the container (label=disable),
+        #   full host integration, host namespaces. --privileged additionally
+        #   grants a nested rootless podman the caps it needs (sethostname,
+        #   mounting /proc); see README.
+        # --isolated: a hardened sandbox — SELinux-confined (no label=disable),
+        #   private namespaces, no host integration, and the mounts relabeled
+        #   with :z so the confined container can use them.
+        relabel=""
+        sec_args=()
+        ns_args=()
+        host_args=()
+        env_args=()
+        if [[ "$isolated" == true ]]; then
+            relabel="z"
+            [[ -n "${TERM:-}" ]] && env_args+=(--env "TERM=$TERM")
+            [[ -n "${LANG:-}" ]] && env_args+=(--env "LANG=$LANG")
+            echo "Isolation: confined (SELinux, private namespaces, no host integration)"
+        else
+            sec_args=(--security-opt label=disable)
+            [[ "$privileged" == true ]] && sec_args+=(--privileged)
+            ns_args=(--network host --ipc host --pid host)
+            mapfile -t host_args < <(build_host_integration_args)
+            mapfile -t env_args < <(build_env_args)
+        fi
+        mapfile -t vol_args < <(build_volume_args "$relabel")
 
         agent_args=()
         if [[ "$copy_ai_agents" == true ]]; then
-            mapfile -t agent_args < <(build_ai_agent_args)
+            mapfile -t agent_args < <(build_ai_agent_args "$relabel")
             found_paths="$(found_ai_agents)"
             if [[ -n "$found_paths" ]]; then
                 echo "AI agent config: $found_paths"
@@ -715,22 +747,15 @@ case "$cmd" in
         authfile_args=()
         [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
 
-        # --privileged gives the single-UID-mapped nested podman the caps it
-        # needs (sethostname, mounting /proc). In rootless podman this is not
-        # real host privilege — just the caps you already have (see README).
         podman create -it \
             --name "$CONTAINER_NAME" \
             --userns=keep-id \
-            --security-opt label=disable \
-            --privileged \
+            "${sec_args[@]}" \
             --hostname toolboxer \
-            --network host \
-            --ipc host \
-            --pid host \
+            "${ns_args[@]}" \
             "${vol_args[@]}" \
             "${host_args[@]}" \
             "${env_args[@]}" \
-            "${device_args[@]}" \
             "${agent_args[@]}" \
             "${authfile_args[@]}" \
             --workdir "$(default_workdir)" \
@@ -771,6 +796,8 @@ case "$cmd" in
                     reinvoke_args+=(-m "$d")
                 done
                 [[ "$copy_ai_agents" == true ]] && reinvoke_args+=(--ai-agents)
+                [[ "$privileged" == true ]] && reinvoke_args+=(--privileged)
+                [[ "$isolated" == true ]] && reinvoke_args+=(--isolated)
                 reinvoke_args+=(create)
                 [[ -n "$DISTRO" ]] && reinvoke_args+=(--distro "$DISTRO")
                 [[ -n "$RELEASE" ]] && reinvoke_args+=(--release "$RELEASE")
