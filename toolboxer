@@ -192,6 +192,11 @@ RELEASE="$config_release"
 AUTHFILE="$config_authfile"
 PRESERVE_FDS=""
 
+# Set by finalize_names: true when the user identified a specific container (by
+# name, or by choosing a distro/release). When pinned, resolve_container must
+# not silently fall back to "the only existing container".
+container_pinned=false
+
 # Resolved mounts, one canonical "src:dest" spec per element (bare paths are
 # stored as "src:src"). Populated by resolve_mount_dirs.
 MOUNT_SPECS=()
@@ -653,9 +658,14 @@ build_volume_args() {
 build_host_integration_args() {
     local args=()
 
+    # NB: /etc/hosts is deliberately NOT bind-mounted. Podman generates its own
+    # (merging the host's entries by default) and we add a self-mapping for the
+    # container hostname via --add-host at create time. Bind-mounting the host's
+    # /etc/hosts read-only would clobber that self-mapping, so resolving the
+    # container's own hostname falls through to DNS and stalls — which shows up
+    # as slow 'sudo' (sudo resolves the local hostname on every call).
     local -a host_configs=(
         /etc/resolv.conf
-        /etc/hosts
         /etc/host.conf
         /etc/hostname
         /etc/localtime
@@ -779,9 +789,37 @@ setup_user_in_container() {
     user_shell="/bin/bash"
     user_home="$HOME"
 
-    # Create group and user (as root inside the container)
-    podman exec --user root "$cname" bash -c "getent group $gid >/dev/null 2>&1 || groupadd -g $gid $user_name"
-    podman exec --user root "$cname" bash -c "id $user_name >/dev/null 2>&1 || useradd -u $uid -g $gid -d $user_home -s $user_shell -M $user_name" 2>/dev/null || true
+    # Make the in-container user match the host (same UID/GID and name) so file
+    # ownership lines up and the sudoers entry below applies. A generic image may
+    # ship a stock account already occupying the host UID/GID — Ubuntu's
+    # ubuntu:1000 is the common case — so rename it rather than failing to add
+    # ours (a plain useradd -u would collide on the in-use UID).
+    podman exec --user root -i "$cname" bash -s -- \
+        "$uid" "$gid" "$user_name" "$user_home" "$user_shell" <<'SETUP' || true
+set -e
+uid="$1"; gid="$2"; user_name="$3"; user_home="$4"; user_shell="$5"
+
+# Group: rename whatever holds the host GID to our name, else create it.
+existing_group="$(getent group "$gid" | cut -d: -f1 || true)"
+if [ -n "$existing_group" ]; then
+    [ "$existing_group" != "$user_name" ] && groupmod -n "$user_name" "$existing_group"
+elif ! getent group "$user_name" >/dev/null 2>&1; then
+    groupadd -g "$gid" "$user_name"
+fi
+
+# User: rename whatever holds the host UID to our name (fixing home/shell/group),
+# else create it. usermod -l renames the colliding account (e.g. ubuntu).
+existing_user="$(getent passwd "$uid" | cut -d: -f1 || true)"
+if [ -n "$existing_user" ]; then
+    if [ "$existing_user" != "$user_name" ]; then
+        usermod -l "$user_name" -d "$user_home" -s "$user_shell" -g "$gid" "$existing_user"
+    else
+        usermod -d "$user_home" -s "$user_shell" -g "$gid" "$user_name"
+    fi
+elif ! id "$user_name" >/dev/null 2>&1; then
+    useradd -u "$uid" -g "$gid" -d "$user_home" -s "$user_shell" -M "$user_name"
+fi
+SETUP
 
     # Ensure sudo is installed — Fedora/RHEL toolbox images ship it, but the
     # generic ubuntu/arch images we support via --distro don't.
@@ -793,12 +831,18 @@ setup_user_in_container() {
             apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y sudo >/dev/null 2>&1
         elif command -v pacman >/dev/null 2>&1; then
             pacman -Sy --noconfirm sudo >/dev/null 2>&1
+        elif command -v zypper >/dev/null 2>&1; then
+            zypper --non-interactive install sudo >/dev/null 2>&1
         fi
     ' || true
 
-    # Grant passwordless sudo
+    # Grant passwordless sudo. Validate the drop-in with visudo so a malformed
+    # file surfaces here instead of silently falling back to a password prompt.
     podman exec --user root "$cname" mkdir -p /etc/sudoers.d
     podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
+    if ! podman exec --user root "$cname" visudo -cf "/etc/sudoers.d/$user_name" >/dev/null 2>&1; then
+        echo "Warning: passwordless-sudo setup for '$user_name' did not validate; sudo may prompt for a password." >&2
+    fi
 
     # Default the nested podman to host networking so it needs no /dev/net/tun
     # (see README). A drop-in merges with the image's own containers.conf.
@@ -869,6 +913,12 @@ resolve_container() {
         return 0
     fi
 
+    # The user asked for a specific container (by name or distro/release) and it
+    # does not exist — don't enter a different one. Let the caller create it.
+    if [[ "$container_pinned" == true ]]; then
+        return 1
+    fi
+
     local containers
     containers="$(podman container list --all --filter 'label=toolboxer=true' --format '{{.Names}}' 2>/dev/null)"
     local count
@@ -888,6 +938,14 @@ resolve_container() {
 # script, so anything still empty here means: no CLI flag, no env value — use
 # the distro/release default.
 finalize_names() {
+    # "Pinned" = the user named a container (flag/env/config) or chose a distro/
+    # release. Captured before CONTAINER_NAME is defaulted below, so a bare
+    # invocation (everything host-default) stays unpinned and may auto-fall-back.
+    if [[ -n "$CONTAINER_NAME" || -n "$DISTRO" || -n "$RELEASE" ]]; then
+        container_pinned=true
+    else
+        container_pinned=false
+    fi
     if [[ -z "$CONTAINER_NAME" ]]; then
         CONTAINER_NAME="$(resolve_name "$DISTRO" "$RELEASE")"
     fi
@@ -1011,11 +1069,17 @@ case "$cmd" in
         authfile_args=()
         [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
 
+        # Run the idle PID 1 as root, not the host user: under --userns=keep-id
+        # it otherwise owns the host account, so setup's usermod fails ("currently
+        # used by process") and a colliding stock user (ubuntu:1000) never gets
+        # renamed. run/enter still exec as the host user.
         podman create -it \
             --name "$CONTAINER_NAME" \
             --userns=keep-id \
+            --user root \
             "${sec_args[@]}" \
             --hostname toolboxer \
+            --add-host toolboxer:127.0.0.1 \
             "${ns_args[@]}" \
             "${vol_args[@]}" \
             "${host_args[@]}" \
@@ -1047,7 +1111,7 @@ case "$cmd" in
         finalize_names
 
         if ! resolve_container; then
-            echo "No toolboxer container found."
+            echo "Container '$CONTAINER_NAME' not found."
             if [[ "$assume_yes" == true ]]; then
                 answer="y"
             else
@@ -1115,7 +1179,7 @@ case "$cmd" in
         finalize_names
 
         if ! resolve_container; then
-            echo "Error: No toolboxer container found."
+            echo "Error: container '$CONTAINER_NAME' not found."
             echo "Create one first with: $prog create"
             exit 1
         fi
@@ -1123,7 +1187,12 @@ case "$cmd" in
         # --preserve-fds (toolbox-compatible): pass N extra inherited fds through.
         pfds_args=()
         [[ -n "$PRESERVE_FDS" ]] && pfds_args=(--preserve-fds "$PRESERVE_FDS")
-        podman exec -it \
+        # Only allocate a TTY when interactive — a forced -t on a pipe makes
+        # podman's PTY rewrite \n to \r\n and corrupt captured output. Keep -i
+        # so stdin can still be piped in.
+        run_tty=(-i)
+        [[ -t 0 && -t 1 ]] && run_tty+=(-t)
+        podman exec "${run_tty[@]}" \
             --user "$(id -u):$(id -g)" \
             --workdir "$(default_workdir)" \
             "${pfds_args[@]}" \

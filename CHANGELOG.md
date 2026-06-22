@@ -30,6 +30,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   existing `MOUNT_DIRS=~/a:~/b` must become `MOUNT_DIRS=~/a,~/b` (it would
   otherwise be read as a single mount of `~/a` at target `~/b`).
 
+### Fixed
+
+- `enter`/`run`/`stop`/`rm` with a pinned distro/release or name no longer
+  silently fall back to the only existing container when the requested one is
+  absent. Previously `toolboxer enter -d ubuntu -r 24.04` would enter an
+  existing Fedora container; now the requested container is reported missing
+  (and `enter` offers to create it).
+- Generic images that ship a stock account at the host's UID/GID — Ubuntu's
+  `ubuntu:1000` being the common case — are now renamed to the host user
+  instead of being left in place. The previous `useradd` collided on the
+  in-use UID and was silently skipped, so the in-container login stayed
+  `ubuntu`, did not match the host, and (since the sudoers drop-in was written
+  for the host username) left `sudo` prompting for a password. The sudoers file
+  is now also validated with `visudo`, warning if it doesn't parse.
+- The container's idle PID 1 (`sleep infinity`) now runs as root rather than the
+  host user. Under `--userns=keep-id` it otherwise ran as the host user, so on
+  first start the account was "in use" and the setup `usermod`/rename failed with
+  `user … is currently used by process`. `run`/`enter` still exec as the host
+  user, so this is invisible in normal use.
+- `sudo` is now installed via `zypper` on openSUSE images too (previously only
+  `dnf`/`apt`/`pacman` were handled, so `--distro opensuse-*` had no sudo).
+- Slow `sudo` (and other hostname lookups) inside the container. The container
+  hostname (`toolboxer`) had no `/etc/hosts` entry — the host's `/etc/hosts` was
+  bind-mounted over podman's generated one — so resolving it fell through to DNS
+  and waited for a timeout. toolboxer no longer bind-mounts `/etc/hosts` (podman
+  still merges the host's entries) and adds a `127.0.0.1 toolboxer` self-mapping.
+- `run` no longer forces a pseudo-TTY. It allocated `-t` unconditionally, so
+  output captured or piped from `toolboxer run …` came back with `\r\n` line
+  endings; a TTY is now requested only when stdin and stdout are both terminals.
+
 ## [0.1.0] - 2026-06-20
 
 First release. A container is isolated by a file boundary — only the

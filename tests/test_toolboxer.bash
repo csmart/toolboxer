@@ -25,6 +25,9 @@ fail() {
     ((TESTS_FAILED++)) || true
     echo -e "  ${RED}FAIL${RESET}: $1"
     [[ -n "${2:-}" ]] && echo "        $2"
+    # Always succeed: a failing last command (the [[ ]] above when $2 is unset)
+    # would otherwise abort the whole suite under 'set -e' on the first failure.
+    return 0
 }
 
 run_test() {
@@ -382,68 +385,184 @@ if [[ -n "${TOOLBOXER_SKIP_PODMAN:-}" ]]; then
 elif ! command -v podman &>/dev/null; then
     echo "  SKIP: podman not found, skipping integration tests"
 else
+    # NOTE: assert on captured output, never `cmd | grep -q`. Under pipefail a
+    # left-hand command that exits non-zero (e.g. the duplicate 'create', or a
+    # 'not found' lookup) — or a SIGPIPE from grep -q closing the pipe early —
+    # makes the pipeline non-zero even when the pattern matched, so the test
+    # would spuriously fail. Capturing with `|| true` sidesteps both.
     run_test
-    if "$TOOLBOXER" create "$TEST_NAME" 2>&1 | grep -q "created"; then
+    output="$("$TOOLBOXER" create "$TEST_NAME" 2>&1 || true)"
+    if grep -q "created" <<<"$output"; then
         pass "create container"
     else
         fail "create container"
     fi
 
     run_test
-    if "$TOOLBOXER" create "$TEST_NAME" 2>&1 | grep -q "already exists"; then
+    output="$("$TOOLBOXER" create "$TEST_NAME" 2>&1 || true)"
+    if grep -q "already exists" <<<"$output"; then
         pass "create rejects duplicate"
     else
         fail "create rejects duplicate"
     fi
 
     run_test
-    if "$TOOLBOXER" list --containers 2>&1 | grep -q "$TEST_NAME"; then
+    output="$("$TOOLBOXER" list --containers 2>&1 || true)"
+    if grep -q "$TEST_NAME" <<<"$output"; then
         pass "list shows container"
     else
         fail "list shows container"
     fi
 
     run_test
-    if "$TOOLBOXER" run --container "$TEST_NAME" echo hello 2>&1 | grep -q "hello"; then
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" echo hello 2>&1 || true)"
+    if grep -q "hello" <<<"$output"; then
         pass "run executes command"
     else
         fail "run executes command"
     fi
 
     run_test
-    if "$TOOLBOXER" run --container "$TEST_NAME" whoami 2>&1 | grep -q "$(whoami)"; then
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" whoami 2>&1 || true)"
+    if grep -q "$(whoami)" <<<"$output"; then
         pass "run preserves username"
     else
         fail "run preserves username"
     fi
 
     run_test
-    if "$TOOLBOXER" run --container "$TEST_NAME" id -u 2>&1 | grep -q "$(id -u)"; then
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" id -u 2>&1 || true)"
+    if grep -q "$(id -u)" <<<"$output"; then
         pass "run preserves UID"
     else
         fail "run preserves UID"
     fi
 
     run_test
-    if "$TOOLBOXER" run --container "$TEST_NAME" sudo true 2>&1; then
+    # Regression: a pinned distro/release that doesn't exist must NOT fall back
+    # to the only existing container ('enter -d ubuntu' used to enter the host
+    # container). It should report the requested container missing instead. Use
+    # a PID-unique fake distro so this never collides with a real container the
+    # user happens to have (e.g. an actual ubuntu-toolbox-24.04).
+    output="$("$TOOLBOXER" run -d "noexist-$$" -r 1 echo nope 2>&1 || true)"
+    if grep -q "not found" <<<"$output"; then
+        pass "pinned distro does not substitute another container"
+    else
+        fail "pinned distro does not substitute another container"
+    fi
+
+    run_test
+    if "$TOOLBOXER" run --container "$TEST_NAME" sudo true >/dev/null 2>&1; then
         pass "sudo works without password"
     else
         fail "sudo works without password"
     fi
 
     run_test
+    # The container's own hostname must resolve via /etc/hosts (the 'files'
+    # source), not fall through to DNS — otherwise sudo, which resolves the
+    # local hostname on every call, stalls on the lookup. Guards against the
+    # host /etc/hosts being bind-mounted over podman's generated one again.
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" getent -s files hosts toolboxer 2>&1 || true)"
+    if grep -q "toolboxer" <<<"$output"; then
+        pass "container hostname resolves via /etc/hosts (fast sudo)"
+    else
+        fail "container hostname resolves via /etc/hosts (fast sudo)"
+    fi
+
+    run_test
     "$TOOLBOXER" stop "$TEST_NAME" >/dev/null 2>&1 || true
-    if "$TOOLBOXER" rm "$TEST_NAME" 2>&1 | grep -q "removed"; then
+    output="$("$TOOLBOXER" rm "$TEST_NAME" 2>&1 || true)"
+    if grep -q "removed" <<<"$output"; then
         pass "rm removes container"
     else
         fail "rm removes container"
     fi
 
     run_test
-    if "$TOOLBOXER" rm "$TEST_NAME" 2>&1 | grep -q "not found"; then
+    output="$("$TOOLBOXER" rm "$TEST_NAME" 2>&1 || true)"
+    if grep -q "not found" <<<"$output"; then
         pass "rm reports not found"
     else
         fail "rm reports not found"
+    fi
+
+    # Per-distro image tests (opt-in — these pull images). Each distro exercises
+    # its own sudo-install path (dnf/apt/pacman/zypper) and the user setup on a
+    # stock base image. Configure with a space-separated list of distro[:release]
+    # entries, e.g.:
+    #   TOOLBOXER_TEST_DISTROS="ubuntu:24.04 debian:12 arch rocky:9" ./tests/...
+    # TOOLBOXER_TEST_UBUNTU=1 is kept as a shorthand for "ubuntu:24.04".
+    test_distros=()
+    [[ -n "${TOOLBOXER_TEST_UBUNTU:-}" ]] && test_distros+=("ubuntu:24.04")
+    if [[ -n "${TOOLBOXER_TEST_DISTROS:-}" ]]; then
+        read -ra _extra_distros <<< "$TOOLBOXER_TEST_DISTROS"
+        test_distros+=("${_extra_distros[@]}")
+    fi
+
+    if [[ ${#test_distros[@]} -gt 0 ]]; then
+        echo ""
+        echo "=== Per-distro image tests ==="
+        dname=""
+        cleanup_distro() {
+            [[ -n "$dname" ]] || return 0
+            "$TOOLBOXER" stop "$dname" >/dev/null 2>&1 || true
+            "$TOOLBOXER" rm -f "$dname" >/dev/null 2>&1 || true
+        }
+        trap 'cleanup; cleanup_config; cleanup_distro' EXIT
+
+        for dentry in "${test_distros[@]}"; do
+            ddistro="${dentry%%:*}"
+            drelease=""
+            [[ "$dentry" == *:* ]] && drelease="${dentry#*:}"
+            dname="toolboxer-${ddistro//[^a-zA-Z0-9]/_}-test-$$"
+            create_args=(-d "$ddistro")
+            [[ -n "$drelease" ]] && create_args+=(-r "$drelease")
+
+            echo "--- $dentry ---"
+            "$TOOLBOXER" rm -f "$dname" >/dev/null 2>&1 || true
+
+            run_test
+            output="$("$TOOLBOXER" create "${create_args[@]}" "$dname" 2>&1 || true)"
+            if grep -q "created" <<<"$output"; then
+                pass "[$dentry] create"
+            else
+                fail "[$dentry] create"
+                cleanup_distro
+                continue
+            fi
+
+            run_test
+            # Confirm the container actually runs the requested distro (the prefix
+            # before any '-' matches the os-release ID, e.g. opensuse-leap→opensuse).
+            output="$("$TOOLBOXER" run --container "$dname" cat /etc/os-release 2>&1 || true)"
+            if grep -qi "${ddistro%%-*}" <<<"$output"; then
+                pass "[$dentry] runs $ddistro"
+            else
+                fail "[$dentry] runs $ddistro"
+            fi
+
+            run_test
+            # In-container login must match the host user (a stock account at the
+            # host UID is renamed, otherwise the user is created), so the
+            # passwordless-sudo drop-in applies.
+            output="$("$TOOLBOXER" run --container "$dname" id -un 2>&1 || true)"
+            if grep -qx "$(id -un)" <<<"$output"; then
+                pass "[$dentry] in-container username matches host"
+            else
+                fail "[$dentry] in-container username matches host"
+            fi
+
+            run_test
+            if "$TOOLBOXER" run --container "$dname" sudo true >/dev/null 2>&1; then
+                pass "[$dentry] passwordless sudo works"
+            else
+                fail "[$dentry] passwordless sudo works"
+            fi
+
+            cleanup_distro
+        done
+        dname=""
     fi
 fi
 
