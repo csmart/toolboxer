@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
@@ -25,7 +25,28 @@ jobs:
           bash -n toolboxer
           bash -n completions/toolboxer.bash
 
-      - name: smoke tests
-        # Integration tests need a working rootless podman; the CLI tests run
-        # without one, so skip the podman half here.
+      - name: cli + config tests (no podman)
         run: TOOLBOXER_SKIP_PODMAN=1 ./tests/test_toolboxer.bash
+
+  integration:
+    # Run on the runner VM itself (no container:): rootless podman works there,
+    # so the full podman suite and the cross-distro image tests run for real.
+    # Inside a container the nested rootless podman fails, which is why the lint
+    # job above can only run the podman-free half.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install podman
+        run: sudo apt-get update && sudo apt-get install -y podman
+
+      - name: podman info
+        run: podman version && podman info --format 'rootless={{.Host.Security.Rootless}}'
+
+      - name: full suite + cross-distro images
+        # Host distro is Ubuntu, so the base suite already covers it; the matrix
+        # adds one image per package manager (dnf, apt, pacman, zypper).
+        run: |
+          TOOLBOXER_TEST_DISTROS="fedora:latest debian:12 arch:latest rocky:9 opensuse-leap:15.6" \
+            ./tests/test_toolboxer.bash
