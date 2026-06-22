@@ -103,6 +103,7 @@ config_distro=""
 config_release=""
 config_container_name=""
 config_authfile=""
+config_provision_script=""
 
 CONFIG_FILE="${TOOLBOXER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/toolboxer/config}"
 
@@ -174,6 +175,7 @@ load_config() {
             release)                  config_release="$value" ;;
             container_name|container) config_container_name="$value" ;;
             authfile)                 config_authfile="$(expand_tilde "$value")" ;;
+            provision_script|provision) config_provision_script="$(expand_tilde "$value")" ;;
             "")                       : ;;
             *) echo "Warning: unknown config key '$key' in $CONFIG_FILE (line $lineno)" >&2 ;;
         esac
@@ -191,6 +193,11 @@ DISTRO="$config_distro"
 RELEASE="$config_release"
 AUTHFILE="$config_authfile"
 PRESERVE_FDS=""
+
+# Optional provision script, run once inside a new container on first start (and
+# on demand via 'provision'). Precedence: $TOOLBOXER_PROVISION > config
+# 'provision_script' > a provision.sh next to the config file. Missing = skipped.
+PROVISION_SCRIPT="$(expand_tilde "${TOOLBOXER_PROVISION:-${config_provision_script:-${CONFIG_FILE%/*}/provision.sh}}")"
 
 # Set by finalize_names: true when the user identified a specific container (by
 # name, or by choosing a distro/release). When pinned, resolve_container must
@@ -336,6 +343,7 @@ Commands:
   rm     [CONTAINER...]   Remove the container(s)
   rmi    <IMAGE...>       Remove toolboxer image(s)
   config                  Show the effective configuration (config file + flags)
+  provision [CONTAINER]   Re-run the provision script in a container
   help                    Show this help
 
 Global options (must come before the command):
@@ -383,8 +391,8 @@ Configuration file (lowest priority — env vars and CLI flags override it):
   Set defaults in a "key = value" file at \$TOOLBOXER_CONFIG, else
   \${XDG_CONFIG_HOME:-~/.config}/toolboxer/config. Keys (all optional):
   mount (DIR or SRC:DEST; repeatable or comma-separated), ai_agents, assumeyes,
-  privileged, isolated, image, distro, release, container_name, authfile.
-  Booleans take true/false. '#' starts a comment. Example:
+  privileged, isolated, image, distro, release, container_name, authfile,
+  provision_script. Booleans take true/false. '#' starts a comment. Example:
 
     mount = ~/code
     mount = ~/data:/data
@@ -596,6 +604,31 @@ flags given before 'config'. Read-only — it changes nothing.
 Examples:
   $prog config
   $prog --privileged config       # preview with a flag applied
+EOF
+    exit "${1:-1}"
+}
+
+usage_provision() {
+    cat <<EOF
+Usage: $prog provision [CONTAINER]
+
+Run the provision script inside CONTAINER (resolved like 'enter' from -d/-r or
+the name). New containers are provisioned automatically on first start; use this
+to re-run after editing the script, or to provision an older container.
+
+The script is read from \$TOOLBOXER_PROVISION, else 'provision_script' in the
+config file, else a provision.sh next to it. It runs as you (with passwordless
+sudo) and is executed with bash. For anything heavy or that must be fast and
+reproducible, build a custom image and use it with -i/--image instead.
+
+Options:
+  -d, --distro DISTRO   Resolve the container by distro
+  -r, --release RELEASE Resolve the container by release
+  -h, --help            Show this help
+
+Examples:
+  $prog provision
+  $prog provision -d ubuntu -r 24.04
 EOF
     exit "${1:-1}"
 }
@@ -868,6 +901,35 @@ fi
 PROFILE
 }
 
+# Run the provision script (if any) in the container as the host user, fed on
+# stdin to bash — only bash is supported, the shebang is ignored. $2="required"
+# turns a missing script into an error rather than a silent skip.
+run_provision() {
+    local cname="$1" required="${2:-}"
+    if [[ ! -f "$PROVISION_SCRIPT" ]]; then
+        if [[ "$required" == "required" ]]; then
+            echo "Error: no provision script at '$PROVISION_SCRIPT'." >&2
+            echo "Set 'provision_script' in $CONFIG_FILE or create that file." >&2
+            exit 1
+        fi
+        return 0
+    fi
+
+    # Expose the container's actual distro/release (from its os-release) so the
+    # script can pick a package manager without re-detecting it.
+    local osrel cdistro="" crelease=""
+    osrel="$(podman exec "$cname" sh -c '. /etc/os-release 2>/dev/null && printf "%s %s" "${ID:-}" "${VERSION_ID:-}"' 2>/dev/null)" || true
+    read -r cdistro crelease <<< "$osrel" || true
+
+    echo "Provisioning from $PROVISION_SCRIPT ..."
+    # Run as the host user (passwordless sudo is available for privileged steps)
+    # in the container's default working directory (a mounted, writable dir).
+    podman exec --user "$(id -u):$(id -g)" -i \
+        --env "TOOLBOXER_DISTRO=$cdistro" \
+        --env "TOOLBOXER_RELEASE=$crelease" \
+        "$cname" bash -s < "$PROVISION_SCRIPT"
+}
+
 ensure_exists() {
     podman container exists "$CONTAINER_NAME"
 }
@@ -903,6 +965,12 @@ ensure_started() {
     if ! podman exec --user root "$CONTAINER_NAME" test -f "/etc/sudoers.d/$user_name" 2>/dev/null; then
         echo "Setting up user environment..."
         setup_user_in_container "$CONTAINER_NAME"
+        # Provision once, after the user/sudo setup. Best-effort: a failure warns
+        # but leaves the container usable.
+        if ! run_provision "$CONTAINER_NAME"; then
+            echo "Warning: provision script failed; the container is still usable." >&2
+            echo "Re-run it after fixing the script with: $prog provision $CONTAINER_NAME" >&2
+        fi
     fi
 }
 
@@ -1396,6 +1464,33 @@ case "$cmd" in
             printf '  %-11s %s\n' "release" "$HOST_VERSION_ID (host default)"
         fi
         printf '  %-11s %s\n' "authfile"   "${AUTHFILE:-(none)}"
+        if [[ -f "$PROVISION_SCRIPT" ]]; then
+            printf '  %-11s %s\n' "provision" "$PROVISION_SCRIPT"
+        else
+            printf '  %-11s %s\n' "provision" "$PROVISION_SCRIPT (not found)"
+        fi
+        ;;
+
+    provision)
+        # On-demand re-run; first start provisions automatically (see usage_provision).
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                -d|--distro)  DISTRO="$2";  shift 2 ;;
+                -r|--release) RELEASE="$2"; shift 2 ;;
+                -h|--help)    usage_provision 0 ;;
+                -*)           echo "Unknown provision option: $1"; usage_provision ;;
+                *)            CONTAINER_NAME="$1"; shift ;;
+            esac
+        done
+
+        finalize_names
+        if ! resolve_container; then
+            echo "Error: container '$CONTAINER_NAME' not found."
+            echo "Create one first with: $prog create"
+            exit 1
+        fi
+        ensure_started
+        run_provision "$CONTAINER_NAME" required
         ;;
 
     help)

@@ -22,6 +22,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   accept `source:dest` to mount a directory at a custom target path inside the
   container (like `podman -v`), in addition to the bare `DIR` form (mounted at
   the same path). The first mount's target is the working directory on `enter`.
+- Provision script: a bash script run inside a new container on first start
+  (and on demand via the new `provision` command) to install packages or prepare
+  it without maintaining a custom image. Resolved from `$TOOLBOXER_PROVISION`,
+  else the `provision_script` config key, else a `provision.sh` beside the config
+  file. Runs as the host user with passwordless sudo, with `TOOLBOXER_DISTRO`
+  and `TOOLBOXER_RELEASE` in the environment; failures warn but don't abort.
 
 ### Changed
 

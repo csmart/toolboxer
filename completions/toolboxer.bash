@@ -6,7 +6,7 @@ _toolboxer() {
     local cur prev words cword
     _init_completion || return
 
-    local commands="create enter run list stop rm rmi config help"
+    local commands="create enter run list stop rm rmi config provision help"
     local global_opts="-m --mount -A --ai-agents --no-ai-agents -y --assumeyes --no-assumeyes --privileged --no-privileged --isolated --no-isolated -h --help"
 
     # Find the subcommand position (skip global options and their arguments)
@@ -141,6 +141,22 @@ _toolboxer() {
         config)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "-h --help" -- "$cur"))
+            fi
+            ;;
+        provision)
+            case "$prev" in
+                -d|--distro)
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    return
+                    ;;
+                -r|--release) return ;;
+            esac
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "-d --distro -r --release -h --help" -- "$cur"))
+            else
+                local containers
+                containers=$(podman container list --all --filter "label=toolboxer=true" --format '{{.Names}}' 2>/dev/null)
+                COMPREPLY=($(compgen -W "$containers" -- "$cur"))
             fi
             ;;
         stop)

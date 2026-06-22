@@ -102,6 +102,13 @@ else
     fail "--help lists the config command"
 fi
 
+run_test
+if "$TOOLBOXER" provision --help 2>&1 | grep -q "provision script"; then
+    pass "provision --help shows usage"
+else
+    fail "provision --help shows usage"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Config file tests (no podman needed) ==="
@@ -486,6 +493,37 @@ else
     else
         fail "rm reports not found"
     fi
+
+    # Provision script: runs on first start, and on demand via 'provision'.
+    prov_script="$CONFIG_TMP/provision.sh"
+    cat > "$prov_script" <<'PROV'
+sudo install -d /opt/toolboxer-provisioned
+PROV
+    prov_name="toolboxer-prov-test-$$"
+    cleanup_prov() { "$TOOLBOXER" rm -f "$prov_name" >/dev/null 2>&1 || true; }
+    trap 'cleanup; cleanup_config; cleanup_prov' EXIT
+
+    run_test
+    TOOLBOXER_PROVISION="$prov_script" "$TOOLBOXER" create "$prov_name" >/dev/null 2>&1 || true
+    TOOLBOXER_PROVISION="$prov_script" "$TOOLBOXER" run -c "$prov_name" true >/dev/null 2>&1 || true
+    output="$("$TOOLBOXER" run -c "$prov_name" ls -d /opt/toolboxer-provisioned 2>&1 || true)"
+    if grep -q "toolboxer-provisioned" <<<"$output"; then
+        pass "provision script runs on first start"
+    else
+        fail "provision script runs on first start"
+    fi
+
+    run_test
+    # Remove the marker, then the explicit command must re-create it.
+    "$TOOLBOXER" run -c "$prov_name" sudo rmdir /opt/toolboxer-provisioned >/dev/null 2>&1 || true
+    TOOLBOXER_PROVISION="$prov_script" "$TOOLBOXER" provision "$prov_name" >/dev/null 2>&1 || true
+    output="$("$TOOLBOXER" run -c "$prov_name" ls -d /opt/toolboxer-provisioned 2>&1 || true)"
+    if grep -q "toolboxer-provisioned" <<<"$output"; then
+        pass "provision command re-runs the script"
+    else
+        fail "provision command re-runs the script"
+    fi
+    cleanup_prov
 
     # Per-distro image tests (opt-in — these pull images). Each distro exercises
     # its own sudo-install path (dnf/apt/pacman/zypper) and the user setup on a
