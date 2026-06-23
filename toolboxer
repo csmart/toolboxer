@@ -854,6 +854,15 @@ elif ! id "$user_name" >/dev/null 2>&1; then
 fi
 SETUP
 
+    # Give the user a writable home. When mounts sit under $HOME (the default
+    # ~/code), podman auto-creates $HOME as a root-owned mount parent, so the
+    # user can't write to it. Create it if missing and hand it over -- not
+    # recursive, so the mounted dirs inside keep their own owners. Left empty by
+    # design (no /etc/skel seeding): bring dotfiles via a mount or the provision
+    # script, rather than us dropping files the user didn't ask for.
+    podman exec --user root "$cname" mkdir -p "$user_home"
+    podman exec --user root "$cname" chown "$uid:$gid" "$user_home"
+
     # Ensure sudo is installed — Fedora/RHEL toolbox images ship it, but the
     # generic ubuntu/arch images we support via --distro don't.
     podman exec --user root "$cname" bash -c '

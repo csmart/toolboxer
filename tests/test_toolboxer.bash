@@ -478,6 +478,17 @@ else
     fi
 
     run_test
+    # The user's home is usually the parent of the mounts, which podman creates
+    # root-owned; setup hands it to the user so ~/.bashrc and provision scripts
+    # can write to it.
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" sh -c "touch '$HOME/.toolboxer-write-test' && echo WRITABLE" 2>&1 || true)"
+    if grep -q "WRITABLE" <<<"$output"; then
+        pass "home directory is writable"
+    else
+        fail "home directory is writable"
+    fi
+
+    run_test
     "$TOOLBOXER" stop "$TEST_NAME" >/dev/null 2>&1 || true
     output="$("$TOOLBOXER" rm "$TEST_NAME" 2>&1 || true)"
     if grep -q "removed" <<<"$output"; then
