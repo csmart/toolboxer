@@ -4,37 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.3.0] - 2026-06-23
+
+### Fixed
+
+- The container's home directory is now writable. The user's home is usually the
+  parent of the mounts (`~` when you mount `~/code`), which podman auto-creates
+  root-owned — so the user couldn't write to its own home, and `~/.bashrc`,
+  `~/.config`, and provision scripts that touch `$HOME` all failed. Setup now
+  creates `$HOME` and hands it to the user (non-recursive, so the mounted dirs
+  inside keep their owners); it is left empty, so bring dotfiles via a mount or
+  the provision script.
+
+## [0.2.0] - 2026-06-23
 
 ### Added
 
-- Configuration file for persistent defaults: a `key = value` file at
-  `$TOOLBOXER_CONFIG`, else `$XDG_CONFIG_HOME/toolboxer/config`, else
-  `~/.config/toolboxer/config`. Keys mirror the CLI options (`mount`,
-  `ai_agents`, `assumeyes`, `privileged`, `isolated`, `image`, `distro`,
-  `release`, `container_name`, `authfile`). Settings resolve by precedence:
-  CLI flags > environment variables > config file > built-in defaults
-- `--no-ai-agents`, `--no-assumeyes`, `--no-privileged`, and `--no-isolated`
-  flags to switch off a default enabled in the config file for a single run
-- `config` command to print the effective configuration (config file location
-  and the resolved settings)
-- `SRC:DEST` mount specs: `-m`, `MOUNT_DIRS`, and the config `mount` key now
-  accept `source:dest` to mount a directory at a custom target path inside the
-  container (like `podman -v`), in addition to the bare `DIR` form (mounted at
-  the same path). The first mount's target is the working directory on `enter`.
 - Provision script: a bash script run inside a new container on first start
   (and on demand via the new `provision` command) to install packages or prepare
   it without maintaining a custom image. Resolved from `$TOOLBOXER_PROVISION`,
   else the `provision_script` config key, else a `provision.sh` beside the config
   file. Runs as the host user with passwordless sudo, with `TOOLBOXER_DISTRO`
   and `TOOLBOXER_RELEASE` in the environment; failures warn but don't abort.
-
-### Changed
-
-- `MOUNT_DIRS` and the config `mount` key now separate multiple mounts with a
-  **comma**, not a colon. Colon is reserved for `SRC:DEST`. **Breaking:** an
-  existing `MOUNT_DIRS=~/a:~/b` must become `MOUNT_DIRS=~/a,~/b` (it would
-  otherwise be read as a single mount of `~/a` at target `~/b`).
 
 ### Fixed
 
@@ -101,6 +92,23 @@ is opt-in rather than the default.
 - Bash completion
 - Smoke tests and a GitHub Actions CI workflow (shellcheck + tests on Fedora)
 - `install.sh` and a `Makefile` for installation
+- Configuration file for persistent defaults: a `key = value` file at
+  `$TOOLBOXER_CONFIG`, else `$XDG_CONFIG_HOME/toolboxer/config`, else
+  `~/.config/toolboxer/config`. Keys mirror the CLI options (`mount`,
+  `ai_agents`, `assumeyes`, `privileged`, `isolated`, `image`, `distro`,
+  `release`, `container_name`, `authfile`). Settings resolve by precedence:
+  CLI flags > environment variables > config file > built-in defaults
+- `--no-ai-agents`, `--no-assumeyes`, `--no-privileged`, and `--no-isolated`
+  flags to switch off a default enabled in the config file for a single run
+- `config` command to print the effective configuration (config file location
+  and the resolved settings)
+- `SRC:DEST` mount specs: `-m`, `MOUNT_DIRS`, and the config `mount` key accept
+  `source:dest` to mount a directory at a custom target path inside the container
+  (like `podman -v`), as well as a bare `DIR` (mounted at the same path). Several
+  mounts are comma-separated — colon is reserved for `source:dest`. The first
+  mount's target is the working directory on `enter`
 
-[Unreleased]: https://github.com/csmart/toolboxer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/csmart/toolboxer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/csmart/toolboxer/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/csmart/toolboxer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/csmart/toolboxer/releases/tag/v0.1.0
