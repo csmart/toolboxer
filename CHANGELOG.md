@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- `--ai-agents` now also mounts `~/.config/cursor`, where Cursor keeps its login,
+  so it carries into the container instead of prompting to sign in again
+  (previously only `~/.cursor` was mounted).
+
 ## [0.3.0] - 2026-06-23
 
 ### Fixed

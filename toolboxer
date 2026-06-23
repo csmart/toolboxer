@@ -772,7 +772,7 @@ AI_AGENT_PATHS=(
     .codex                                      # OpenAI Codex
     .gemini                                     # Gemini CLI (Google)
     .qwen                                       # Qwen Code
-    .cursor                                     # Cursor agent
+    .cursor .config/cursor                      # Cursor agent
     .grok .config/grok                          # Grok CLI (xAI)
     .continue                                   # Continue
     .config/github-copilot .copilot             # GitHub Copilot CLI
