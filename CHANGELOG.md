@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- `rm` now requires an explicit target, matching `toolbox`: a bare `toolboxer rm`
+  errors with "missing argument" instead of defaulting to the host container.
+  A name, `--all`, or `-d`/`-r` still works. Unlike `enter`/`run`/`stop`, `rm`
+  never falls back to the host default or the only existing container, so it
+  can't remove one you didn't name.
+
 ### Fixed
 
 - `--ai-agents` now also mounts `~/.config/cursor`, where Cursor keeps its login,

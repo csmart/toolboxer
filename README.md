@@ -19,7 +19,7 @@ A motivating use case is **running AI coding agents without trusting them with y
 - **Provision script** — run a bash script in each new container on first start (and on demand) to install packages or otherwise prepare it, without maintaining a custom image (see [Provisioning](#provisioning)).
 - **toolbox-compatible CLI** — implements every user-facing `toolbox` command (`create`, `enter`, `run`, `list`, `rm`, `rmi`, `help`) and their flags, so existing `toolbox` invocations work unchanged (see [Compatibility with toolbox](#compatibility-with-toolbox)).
 - **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. The default image **matches your host** (read from `/etc/os-release`), and unrecognised distros are mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
-- **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically.
+- **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically (`enter`/`run`/`stop` only — `rm` needs an explicit target, like `toolbox`).
 
 ## Requirements
 
@@ -171,7 +171,7 @@ Running `toolboxer` with no command defaults to `enter`.
 | `-r`, `--release RELEASE` | Remove the container for a different release |
 | `[CONTAINER...]` | Container name(s) (positional) |
 
-With no name, `rm` (like `enter`/`run`/`stop`) resolves the container from `-d`/`-r` (or the host defaults), so `toolboxer rm -r 44` removes `fedora-toolbox-44` without typing the full name.
+`rm` needs an explicit target — a name, `--all`, or `-d`/`-r` (which resolve the name, so `toolboxer rm -r 44` removes `fedora-toolbox-44`). A bare `toolboxer rm` is an error, matching `toolbox`: **unlike `enter`/`run`/`stop`, `rm` never falls back to the host-default or the only existing container**, so it can't remove one you didn't name.
 
 ### `rmi` options
 

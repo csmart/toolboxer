@@ -109,6 +109,24 @@ else
     fail "provision --help shows usage"
 fi
 
+# rm needs an explicit target (like toolbox): a bare 'rm' errors before podman
+# is touched, while a name/-d/-r resolves a target and gets past that guard.
+run_test
+output="$(TOOLBOXER_CONFIG=/nonexistent "$TOOLBOXER" rm 2>&1 || true)"
+if grep -q "missing argument" <<<"$output"; then
+    pass "bare rm errors with missing argument"
+else
+    fail "bare rm errors with missing argument"
+fi
+
+run_test
+output="$(TOOLBOXER_CONFIG=/nonexistent "$TOOLBOXER" rm -r 44 2>&1 || true)"
+if ! grep -q "missing argument" <<<"$output"; then
+    pass "rm -r resolves a target (no missing-argument error)"
+else
+    fail "rm -r resolves a target (no missing-argument error)"
+fi
+
 # ---------------------------------------------------------------------------
 echo ""
 echo "=== Config file tests (no podman needed) ==="

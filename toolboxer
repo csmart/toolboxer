@@ -532,10 +532,10 @@ usage_rm() {
     cat <<EOF
 Usage: $prog rm [options] [CONTAINER...]
 
-Remove one or more toolboxer containers. With no names and no --all, the
-container is resolved the same way as 'create' — from --distro/--release (or
-the host defaults) — so you can remove a container without typing its full
-name. Running containers need --force.
+Remove one or more toolboxer containers. Like toolbox, this needs an explicit
+target: a container name, --all, or --distro/--release (which resolve the name
+for you). A bare 'rm' is an error — unlike enter/run/stop, it never falls back
+to the host default or the only container. Running containers need --force.
 
 Options:
   -a, --all             Remove all toolboxer containers
@@ -545,7 +545,6 @@ Options:
   -h, --help            Show this help
 
 Examples:
-  $prog rm
   $prog rm my-project another-project
   $prog rm -r 44                  # removes the fedora-toolbox-44 container
   $prog rm --all --force
@@ -1362,9 +1361,17 @@ case "$cmd" in
                 fi
             done <<< "$containers"
         else
-            # If specific containers were named, use those; otherwise use default
+            # No names: resolve a target only if one was actually specified
+            # (-d/-r, or an env/config default). A bare 'rm' is an error, like
+            # toolbox — it never removes a container you didn't name, and (unlike
+            # enter/run/stop) it does not fall back to the only container.
             if [[ ${#local_containers[@]} -eq 0 ]]; then
                 finalize_names
+                if [[ "$container_pinned" != true ]]; then
+                    echo "Error: missing argument for 'rm' — name a container, or use --all."
+                    echo "Run '$prog rm --help' for usage."
+                    exit 1
+                fi
                 local_containers=("$CONTAINER_NAME")
             fi
             for cname in "${local_containers[@]}"; do
