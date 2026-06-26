@@ -48,7 +48,7 @@ _toolboxer() {
         create)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -i|--image)
@@ -76,7 +76,7 @@ _toolboxer() {
         enter)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;
@@ -98,7 +98,7 @@ _toolboxer() {
                     return
                     ;;
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;
@@ -116,7 +116,7 @@ _toolboxer() {
         rm)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;
@@ -146,7 +146,7 @@ _toolboxer() {
         provision)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;
@@ -162,7 +162,7 @@ _toolboxer() {
         stop)
             case "$prev" in
                 -d|--distro)
-                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed" -- "$cur"))
+                    COMPREPLY=($(compgen -W "fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed archlinux" -- "$cur"))
                     return
                     ;;
                 -r|--release) return ;;

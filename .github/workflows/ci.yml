@@ -34,7 +34,7 @@ jobs:
     # Inside a container the nested rootless podman fails, which is why the lint
     # job above can only run the podman-free half.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -44,9 +44,19 @@ jobs:
       - name: podman info
         run: podman version && podman info --format 'rootless={{.Host.Security.Rootless}}'
 
-      - name: full suite + cross-distro images
-        # Host distro is Ubuntu, so the base suite already covers it; the matrix
-        # adds one image per package manager (dnf, apt, pacman, zypper).
+      - name: full suite + every distro
+        # The base suite covers the Ubuntu host; the matrix then builds and boots
+        # every supported distro for real, exercising each package manager's
+        # sudo-install path (dnf, apt, pacman, zypper) and the user setup. Bare
+        # entries carry no release, so they test the default-release resolution
+        # for a non-host distro — which must NOT inherit the host's version (no
+        # "opensuse-leap 24.04"). Pinned entries (debian:12, rocky:9, ubuntu:22.04)
+        # additionally assert the version matches the request: debian:12/rocky:9
+        # check the major, and ubuntu:jammy checks a codename end-to-end (jammy is
+        # 22.04, which also differs from the 24.04 runner, proving the requested
+        # version is pulled, not the host's). The opensuse/suse/leap aliases reuse
+        # the already-pulled Leap image (no extra pull) to confirm canonicalisation
+        # survives a real create; tumbleweed does the same for the rolling image.
         run: |
-          TOOLBOXER_TEST_DISTROS="fedora:latest debian:12 arch:latest rocky:9 opensuse-leap:15.6" \
+          TOOLBOXER_TEST_DISTROS="fedora rhel centos arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed debian:12 rocky:9 ubuntu:jammy" \
             ./tests/test_toolboxer.bash

@@ -24,24 +24,88 @@ fi
 
 DEFAULT_MOUNT_DIRS="${HOME}/code"
 
+# Normalise distro aliases to a canonical key. Bare "opensuse"/"suse"/"leap" mean
+# openSUSE Leap (the stable point release) and "tumbleweed" means Tumbleweed, so
+# they resolve to the same container as the full name — rather than falling
+# through to the host-ID_LIKE mapping, which off a non-SUSE host lands on Fedora.
+canonical_distro() {
+    case "$1" in
+        opensuse|suse|leap) echo "opensuse-leap" ;;
+        tumbleweed)         echo "opensuse-tumbleweed" ;;
+        archlinux)          echo "arch" ;;
+        *)                  echo "$1" ;;
+    esac
+}
+
+# Rolling distros have no versioned tags — only a moving :latest. A pinned
+# --release for one (e.g. arch:2022) can't be honoured, so finalize_names rejects
+# it rather than silently handing over today's image under a stale version.
+is_rolling_distro() {
+    case "$1" in
+        arch|opensuse-tumbleweed) return 0 ;;
+        *)                        return 1 ;;
+    esac
+}
+
+# The distros we map to an image directly (after canonical_distro). An explicit
+# --distro outside this set is a typo or unsupported name, so finalize_names
+# rejects it rather than letting resolve_image fall through to the host-ID_LIKE
+# default (which off a non-derivative host would silently build Fedora). The
+# ID_LIKE fallback still applies to an unrecognised *host* distro (no --distro).
+KNOWN_DISTROS="fedora rhel centos rocky ubuntu debian arch opensuse-leap opensuse-tumbleweed"
+is_known_distro() {
+    case " $KNOWN_DISTROS " in
+        *" $1 "*) return 0 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# A sensible default release when the user didn't pin one with -r/--release.
+# The host's VERSION_ID only makes sense for the host's own distro — there is no
+# "Ubuntu 44" — so any *other* distro falls back to its current tag. The RHEL
+# family shares a major-version scheme, so those default to a recent major.
+default_release() {
+    local distro="${1:-$HOST_ID}"
+    if [[ "$distro" == "$HOST_ID" ]]; then
+        echo "$HOST_VERSION_ID"
+    else
+        case "$distro" in
+            rhel|centos|rocky) echo "9" ;;
+            *)                 echo "latest" ;;
+        esac
+    fi
+}
+
 # Resolve the container image from distro + release.
 #
-# Known distros map to their official toolbox/base image at the host's release.
+# Known distros map to their official toolbox/base image at the given release
+# (defaulting via default_release). The release is used verbatim in the tag, so a
+# point release the registry doesn't publish (e.g. rocky:8.10 — Rocky ships only
+# major tags) fails to pull rather than being silently rounded down to the major.
 # A distro we don't recognise directly is mapped to a base via its os-release
-# ID_LIKE (resolve_image_from_like): derivatives such as Mint/Pop!_OS/Manjaro
-# go to their parent, and any RHEL-family clone (Rocky, AlmaLinux, Oracle, …)
+# ID_LIKE (resolve_image_from_like): derivatives such as Mint/Pop!_OS/Manjaro go
+# to their parent, and any RHEL-family clone (Rocky, AlmaLinux, Oracle, …)
 # defaults to Rocky Linux — a binary-compatible image, unlike Fedora. Anything
 # still unrecognised falls back to Fedora's toolbox image.
 resolve_image() {
     local distro="${1:-$HOST_ID}"
-    local release="${2:-$HOST_VERSION_ID}"
+    distro="$(canonical_distro "$distro")"
+    local release="$2"
+    [[ -n "$release" ]] || release="$(default_release "$distro")"
     case "$distro" in
         fedora)              echo "registry.fedoraproject.org/fedora-toolbox:${release}" ;;
-        rhel)                echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}" ;;
-        centos)              echo "quay.io/centos/centos:stream${release%%.*}" ;;
-        rocky)               echo "docker.io/library/rockylinux:${release%%.*}" ;;
+        rhel)
+            # ubiN/toolbox publishes :latest and :N.M tags, not a bare :N.
+            if [[ "$release" == *.* ]]; then
+                echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:${release}"
+            else
+                echo "registry.access.redhat.com/ubi${release%%.*}/toolbox:latest"
+            fi
+            ;;
+        centos)              echo "quay.io/centos/centos:stream${release}" ;;
+        rocky)               echo "docker.io/library/rockylinux:${release}" ;;
         ubuntu)              echo "docker.io/library/ubuntu:${release}" ;;
-        debian)              echo "docker.io/library/debian:${release%%.*}" ;;
+        debian)              echo "docker.io/library/debian:${release}" ;;
         arch)                echo "docker.io/library/archlinux:latest" ;;
         opensuse-leap)       echo "registry.opensuse.org/opensuse/leap:${release}" ;;
         opensuse-tumbleweed) echo "registry.opensuse.org/opensuse/tumbleweed:latest" ;;
@@ -70,10 +134,14 @@ resolve_image_from_like() {
     echo "registry.fedoraproject.org/fedora-toolbox:latest"
 }
 
-# Resolve the default container name from distro + release
+# Resolve the default container name from distro + release. Uses the same
+# release default as resolve_image so the name matches the image actually pulled
+# (e.g. ubuntu-toolbox-latest, not ubuntu-toolbox-44 on a Fedora 44 host).
 resolve_name() {
     local distro="${1:-$HOST_ID}"
-    local release="${2:-$HOST_VERSION_ID}"
+    distro="$(canonical_distro "$distro")"
+    local release="$2"
+    [[ -n "$release" ]] || release="$(default_release "$distro")"
     echo "${distro}-toolbox-${release}"
 }
 
@@ -423,9 +491,16 @@ from the distro and release (e.g. ${HOST_ID}-toolbox-${HOST_VERSION_ID}).
 
 Options:
   -d, --distro DISTRO   Base distro: fedora, rhel, centos, rocky, ubuntu, debian,
-                        arch, opensuse-leap, opensuse-tumbleweed
+                        arch, opensuse-leap, opensuse-tumbleweed (aliases:
+                        opensuse/suse/leap -> opensuse-leap, tumbleweed ->
+                        opensuse-tumbleweed, archlinux -> arch). An unknown distro
+                        is rejected; use --image for anything not listed
                         (default: host distro, $HOST_ID; incompatible with --image)
-  -r, --release RELEASE Distro release/version
+  -r, --release RELEASE Distro release/version, used verbatim as the image tag. For
+                        a distro other than the host's, defaults to that distro's
+                        current tag, not the host release. A release the registry
+                        doesn't publish fails the pull; rolling distros (arch,
+                        opensuse-tumbleweed) take no release
                         (default: host release, $HOST_VERSION_ID; incompatible with --image)
   -i, --image NAME      Use a custom image (incompatible with --distro/--release)
       --authfile FILE   Registry credentials file for pulling the image
@@ -1022,6 +1097,27 @@ finalize_names() {
     else
         container_pinned=false
     fi
+    # Canonicalise an alias (opensuse/suse/tumbleweed) once, so every downstream
+    # use — name, image, the 'config' output, and messages — agrees. Then reject
+    # an explicit distro we don't support: a typo like '-d bubuntu' should fail
+    # outright, not quietly resolve to Fedora via the host-ID_LIKE fallback.
+    if [[ -n "$DISTRO" ]]; then
+        DISTRO="$(canonical_distro "$DISTRO")"
+        if ! is_known_distro "$DISTRO"; then
+            echo "Error: unknown distro '$DISTRO'." >&2
+            echo "Supported: $KNOWN_DISTROS" >&2
+            echo "Aliases: opensuse/suse/leap -> opensuse-leap, tumbleweed -> opensuse-tumbleweed, archlinux -> arch." >&2
+            echo "For anything else, use --image with an explicit image." >&2
+            exit 1
+        fi
+        # A rolling distro has no versioned tags — reject a pinned release rather
+        # than quietly returning today's :latest under a version that won't match.
+        if is_rolling_distro "$DISTRO" && [[ -n "$RELEASE" && "$RELEASE" != latest ]]; then
+            echo "Error: '$DISTRO' is a rolling release with no versioned tags;" >&2
+            echo "'--release $RELEASE' can't be honoured. Drop --release, or use --release latest." >&2
+            exit 1
+        fi
+    fi
     if [[ -z "$CONTAINER_NAME" ]]; then
         CONTAINER_NAME="$(resolve_name "$DISTRO" "$RELEASE")"
     fi
@@ -1144,6 +1240,21 @@ case "$cmd" in
         # --authfile (toolbox-compatible): credentials for pulling the image.
         authfile_args=()
         [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
+
+        # Pull explicitly so a tag the registry doesn't publish (e.g. a point
+        # release like rocky:8.10) fails here with a clear reason instead of a raw
+        # podman error mid-create — and is never silently swapped for another
+        # version. Skipped when the image is already present locally.
+        if ! podman image exists "$IMAGE"; then
+            if ! podman pull "${authfile_args[@]}" "$IMAGE"; then
+                echo "" >&2
+                echo "Error: could not pull '$IMAGE'." >&2
+                echo "That image or tag may not exist. Some distros publish only major-version" >&2
+                echo "tags (e.g. rockylinux:9, centos:stream9), not every point release — pin a" >&2
+                echo "tag that exists, or use --image to name an exact image." >&2
+                exit 1
+            fi
+        fi
 
         # Run the idle PID 1 as root, not the host user: under --userns=keep-id
         # it otherwise owns the host account, so setup's usermod fails ("currently

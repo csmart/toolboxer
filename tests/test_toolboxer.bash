@@ -34,6 +34,24 @@ run_test() {
     ((TESTS_RUN++)) || true
 }
 
+# Does a container's os-release (VERSION_ID $1, VERSION_CODENAME $2) satisfy the
+# requested release $3? A named request matches the codename (ubuntu:jammy ->
+# VERSION_CODENAME=jammy, debian:bookworm -> bookworm). A numeric request matches
+# on the major version: image tags rarely pin a point release (rockylinux:8 is
+# whatever 8.x is current, debian:12 carries no minor, and there's no
+# rockylinux:8.10 tag), so the major is the honest precision — it still catches a
+# wrong version (rocky 8 vs 9, ubuntu 22.04 vs 24.04) without flaking on the
+# floating minor. An exact VERSION_ID match short-circuits (ubuntu:22.04 -> 22.04).
+release_matches() {
+    local cver="$1" ccode="$2" req="$3"
+    if [[ "$cver" == "$req" ]] \
+        || [[ -n "$ccode" && "$ccode" == "$req" ]] \
+        || [[ "$req" == [0-9]* && "${cver%%.*}" == "${req%%.*}" ]]; then
+        return 0
+    fi
+    return 1
+}
+
 cleanup() {
     podman rm -f "$TEST_NAME" >/dev/null 2>&1 || true
 }
@@ -93,6 +111,47 @@ if grep -q "incompatible" <<<"$output"; then
     pass "--image and --distro are incompatible"
 else
     fail "--image and --distro are incompatible"
+fi
+
+run_test
+# An unrecognised --distro is rejected (before any pull), not silently resolved
+# to Fedora via the host-ID_LIKE fallback. A known alias must still be accepted.
+output="$("$TOOLBOXER" create -d bubuntu 2>&1 || true)"
+if grep -q "unknown distro 'bubuntu'" <<<"$output"; then
+    pass "unknown --distro is rejected"
+else
+    fail "unknown --distro is rejected"
+fi
+
+run_test
+# The same validation lives in finalize_names, so it applies to every command
+# that takes -d, not just create.
+output="$("$TOOLBOXER" enter -d bubuntu 2>&1 || true)"
+if grep -q "unknown distro 'bubuntu'" <<<"$output"; then
+    pass "unknown --distro is rejected by other commands too (enter)"
+else
+    fail "unknown --distro is rejected by other commands too (enter)"
+fi
+
+run_test
+# A pinned release on a rolling distro (no versioned tags) is rejected, rather
+# than quietly handing over today's :latest under a stale version. (The release-
+# less positive case is covered below and by the arch entry in the matrix.)
+output="$("$TOOLBOXER" create -d arch -r 2022 2>&1 || true)"
+if grep -qi "rolling release" <<<"$output"; then
+    pass "rolling distro rejects a pinned release"
+else
+    fail "rolling distro rejects a pinned release"
+fi
+
+run_test
+# The other rolling distro, reached via an alias — proves the rolling check runs
+# after canonicalisation (tumbleweed -> opensuse-tumbleweed).
+output="$("$TOOLBOXER" create -d tumbleweed -r 20240101 2>&1 || true)"
+if grep -qi "rolling release" <<<"$output"; then
+    pass "rolling distro rejects a pinned release via an alias (tumbleweed)"
+else
+    fail "rolling distro rejects a pinned release via an alias (tumbleweed)"
 fi
 
 run_test
@@ -284,6 +343,21 @@ else
     fail "config reads distro and release"
 fi
 
+# A rolling distro with 'latest' (or no release) is accepted — only a *pinned*
+# version is rejected. 'config' runs finalize_names without pulling, so this
+# exercises the positive path podman-free.
+cat > "$CONFIG_TMP/rolling-ok" <<EOF
+distro  = arch
+release = latest
+EOF
+run_test
+output="$(TOOLBOXER_CONFIG="$CONFIG_TMP/rolling-ok" "$TOOLBOXER" config 2>&1 || true)"
+if grep -qE "distro +arch" <<<"$output" && ! grep -qi "rolling release" <<<"$output"; then
+    pass "rolling distro accepts release=latest"
+else
+    fail "rolling distro accepts release=latest"
+fi
+
 # A leading ~ in a path value expands to $HOME.
 cat > "$CONFIG_TMP/tilde" <<EOF
 mount = ~/projects
@@ -403,6 +477,105 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "=== Image/name resolution (no podman needed) ==="
+
+# Fast guard for "the right distro is pulled": source just the resolution
+# helpers out of the script and check the distro→image mapping directly. The
+# integration matrix below proves it against real registries but is opt-in and
+# heavy; this runs on every push. A synthetic Fedora 44 host keeps the
+# assertions independent of whoever runs the suite.
+# Exported (not just assigned) so the sourced helpers see them — and so the
+# linter doesn't read them as unused here.
+export HOST_ID="fedora" HOST_VERSION_ID="44" HOST_ID_LIKE=""
+RESOLVE_SRC="$(mktemp)"
+sed -n '/^canonical_distro() {/,/^}/p; /^default_release() {/,/^}/p; /^resolve_image() {/,/^}/p; /^resolve_image_from_like() {/,/^}/p; /^resolve_name() {/,/^}/p' "$TOOLBOXER" > "$RESOLVE_SRC"
+# shellcheck source=/dev/null
+source "$RESOLVE_SRC"
+rm -f "$RESOLVE_SRC"
+
+assert_resolve() {  # description  expected  actual
+    run_test
+    if [[ "$2" == "$3" ]]; then
+        pass "$1"
+    else
+        fail "$1" "expected '$2', got '$3'"
+    fi
+}
+
+# The host distro uses the host's release; every other distro must NOT inherit
+# it (no ubuntu:44 / leap:44) — the bug where 'create -d opensuse-leap' resolved
+# to a nonexistent host-release tag (and a positional 'create opensuse-leap'
+# quietly built the host distro instead).
+assert_resolve "fedora (host) keeps the host release" \
+    "registry.fedoraproject.org/fedora-toolbox:44" "$(resolve_image fedora "")"
+assert_resolve "ubuntu default tag is latest, not host 44" \
+    "docker.io/library/ubuntu:latest" "$(resolve_image ubuntu "")"
+assert_resolve "opensuse-leap default tag is latest, not host 44" \
+    "registry.opensuse.org/opensuse/leap:latest" "$(resolve_image opensuse-leap "")"
+assert_resolve "rhel default is ubiN:latest (no bare ubiN:N tag exists)" \
+    "registry.access.redhat.com/ubi9/toolbox:latest" "$(resolve_image rhel "")"
+assert_resolve "centos default is a current stream" \
+    "quay.io/centos/centos:stream9" "$(resolve_image centos "")"
+# Explicit -r is still honoured.
+assert_resolve "explicit ubuntu release is honoured" \
+    "docker.io/library/ubuntu:24.04" "$(resolve_image ubuntu 24.04)"
+assert_resolve "explicit rhel minor keeps its exact tag" \
+    "registry.access.redhat.com/ubi9/toolbox:9.4" "$(resolve_image rhel 9.4)"
+# A point release is passed through verbatim (not rounded to the major), so the
+# pull faithfully gets it — or fails — instead of silently substituting.
+assert_resolve "rocky point release is not stripped to the major" \
+    "docker.io/library/rockylinux:8.10" "$(resolve_image rocky 8.10)"
+assert_resolve "debian point release is not stripped to the major" \
+    "docker.io/library/debian:12.8" "$(resolve_image debian 12.8)"
+# The container name tracks the same default, so it matches the pulled image.
+assert_resolve "container name tracks the default-release image" \
+    "ubuntu-toolbox-latest" "$(resolve_name ubuntu "")"
+
+# Distro aliases canonicalise to the same image AND name as the full key, so
+# 'opensuse'/'suse'/'tumbleweed' don't fall through to Fedora off a non-SUSE host.
+assert_resolve "opensuse aliases to leap" \
+    "registry.opensuse.org/opensuse/leap:latest" "$(resolve_image opensuse "")"
+assert_resolve "suse aliases to leap" \
+    "registry.opensuse.org/opensuse/leap:latest" "$(resolve_image suse "")"
+assert_resolve "leap aliases to opensuse-leap" \
+    "registry.opensuse.org/opensuse/leap:latest" "$(resolve_image leap "")"
+assert_resolve "tumbleweed aliases to opensuse-tumbleweed" \
+    "registry.opensuse.org/opensuse/tumbleweed:latest" "$(resolve_image tumbleweed "")"
+assert_resolve "opensuse alias name matches the full key" \
+    "opensuse-leap-toolbox-latest" "$(resolve_name opensuse "")"
+assert_resolve "tumbleweed alias name matches the full key" \
+    "opensuse-tumbleweed-toolbox-latest" "$(resolve_name tumbleweed "")"
+assert_resolve "archlinux aliases to arch" \
+    "docker.io/library/archlinux:latest" "$(resolve_image archlinux "")"
+assert_resolve "archlinux alias name matches the full key" \
+    "arch-toolbox-latest" "$(resolve_name archlinux "")"
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Release matching (no podman needed) ==="
+
+# The matrix's pinned-release check uses release_matches; verify its logic here
+# without pulling, across exact, major-only, floating-minor, and codename forms.
+assert_release() {  # description  cver  ccode  request  expect(yes|no)
+    run_test
+    if release_matches "$2" "$3" "$4"; then local got=yes; else local got=no; fi
+    if [[ "$got" == "$5" ]]; then
+        pass "$1"
+    else
+        fail "$1" "release_matches('$2','$3','$4') = $got, expected $5"
+    fi
+}
+assert_release "exact numeric matches (ubuntu:22.04 -> 22.04)" 22.04 jammy 22.04 yes
+assert_release "major request matches floating minor (rocky:9 -> 9.3)" 9.3 "" 9 yes
+assert_release "major.minor request matches same-major image (rocky:8.10 -> 8.9)" 8.9 "" 8.10 yes
+assert_release "codename request matches VERSION_CODENAME (ubuntu:jammy)" 22.04 jammy jammy yes
+assert_release "codename request matches debian (bookworm -> 12)" 12 bookworm bookworm yes
+assert_release "wrong major is rejected (ubuntu:22.04 must not accept 24.04)" 24.04 noble 22.04 no
+assert_release "wrong codename is rejected" 22.04 jammy noble no
+assert_release "major mismatch rejected (rocky 8 vs 9)" 9.3 "" 8 no
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "=== Podman integration tests ==="
 
 if [[ -n "${TOOLBOXER_SKIP_PODMAN:-}" ]]; then
@@ -466,10 +639,12 @@ else
     run_test
     # Regression: a pinned distro/release that doesn't exist must NOT fall back
     # to the only existing container ('enter -d ubuntu' used to enter the host
-    # container). It should report the requested container missing instead. Use
-    # a PID-unique fake distro so this never collides with a real container the
-    # user happens to have (e.g. an actual ubuntu-toolbox-24.04).
-    output="$("$TOOLBOXER" run -d "noexist-$$" -r 1 echo nope 2>&1 || true)"
+    # container). It should report the requested container missing instead. Use a
+    # real distro (an unknown one is now rejected outright — tested separately)
+    # with a PID-unique release, so the resolved name (debian-toolbox-0.<pid>)
+    # can't collide with a container the user happens to have. 'run' reports the
+    # missing container without pulling, so the bogus release never hits a registry.
+    output="$("$TOOLBOXER" run -d debian -r "0.$$" echo nope 2>&1 || true)"
     if grep -q "not found" <<<"$output"; then
         pass "pinned distro does not substitute another container"
     else
@@ -554,6 +729,20 @@ PROV
     fi
     cleanup_prov
 
+    run_test
+    # A pinned release the registry doesn't publish (rocky ships only major tags,
+    # so rockylinux:8.10 is no such tag) must fail the pull with a clear reason,
+    # never silently fall back to rocky:8. Needs network to attempt the pull.
+    badrel_name="toolboxer-badrel-test-$$"
+    "$TOOLBOXER" rm -f "$badrel_name" >/dev/null 2>&1 || true
+    output="$("$TOOLBOXER" create -d rocky -r 8.10 "$badrel_name" 2>&1 || true)"
+    if grep -qi "could not pull" <<<"$output" && ! "$TOOLBOXER" run --container "$badrel_name" true >/dev/null 2>&1; then
+        pass "unpullable pinned release fails with a clear error"
+    else
+        fail "unpullable pinned release fails with a clear error"
+    fi
+    "$TOOLBOXER" rm -f "$badrel_name" >/dev/null 2>&1 || true
+
     # Per-distro image tests (opt-in — these pull images). Each distro exercises
     # its own sudo-install path (dnf/apt/pacman/zypper) and the user setup on a
     # stock base image. Configure with a space-separated list of distro[:release]
@@ -600,13 +789,40 @@ PROV
             fi
 
             run_test
-            # Confirm the container actually runs the requested distro (the prefix
-            # before any '-' matches the os-release ID, e.g. opensuse-leap→opensuse).
+            # Confirm the container actually runs the requested distro by reading
+            # its os-release ID exactly — the canonical key matches the ID for
+            # every distro we support (opensuse-leap→opensuse-leap, rocky→rocky, …).
+            # canonical_distro (sourced above) folds aliases first, so an entry of
+            # 'opensuse'/'suse'/'leap' is checked against 'opensuse-leap'. A loose
+            # substring match would let a wrong image (e.g. fedora pulled for
+            # opensuse-leap, the host-release default-tag bug) slip through.
+            expect_id="$(canonical_distro "$ddistro")"
             output="$("$TOOLBOXER" run --container "$dname" cat /etc/os-release 2>&1 || true)"
-            if grep -qi "${ddistro%%-*}" <<<"$output"; then
-                pass "[$dentry] runs $ddistro"
+            # '|| true' on every extraction: a field can be absent (most distros
+            # have no VERSION_CODENAME — only Debian/Ubuntu do), and under
+            # 'set -euo pipefail' a no-match grep in a command substitution would
+            # otherwise abort the whole suite instead of just yielding an empty value.
+            osid="$(grep -E '^ID=' <<<"$output" | head -1 | cut -d= -f2- | tr -d '"'\''\r ' || true)"
+            if [[ "$osid" == "$expect_id" ]]; then
+                pass "[$dentry] runs $expect_id (ID=$osid)"
             else
-                fail "[$dentry] runs $ddistro"
+                fail "[$dentry] runs $expect_id (got ID=${osid:-?})"
+            fi
+
+            # When a release was pinned, confirm the image really is that version
+            # — '-d ubuntu -r 24.04' must pull 24.04, not just "an ubuntu". Matches
+            # a codename (ubuntu:jammy) or the major for a numeric request (see
+            # release_matches). Bare entries pull a rolling/latest tag with no
+            # fixed version, so there's nothing to assert.
+            if [[ -n "$drelease" ]]; then
+                run_test
+                cver="$(grep -E '^VERSION_ID=' <<<"$output" | head -1 | cut -d= -f2- | tr -d '"'\''\r ' || true)"
+                ccode="$(grep -E '^VERSION_CODENAME=' <<<"$output" | head -1 | cut -d= -f2- | tr -d '"'\''\r ' || true)"
+                if release_matches "$cver" "$ccode" "$drelease"; then
+                    pass "[$dentry] is release $drelease (VERSION_ID=$cver${ccode:+, $ccode})"
+                else
+                    fail "[$dentry] is release $drelease (got VERSION_ID=${cver:-?}${ccode:+, $ccode})"
+                fi
             fi
 
             run_test

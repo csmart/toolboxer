@@ -4,6 +4,42 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- `--distro` aliases: `opensuse`/`suse`/`leap` map to `opensuse-leap`
+  (openSUSE's stable point release), `tumbleweed` to `opensuse-tumbleweed`, and
+  `archlinux` to `arch`. They canonicalise to the same container as the full
+  name, so `-d opensuse` no longer falls through to the host's `ID_LIKE`
+  default — which, off a non-SUSE host, silently built Fedora.
+
+### Changed
+
+- An unrecognised `--distro` now fails with the list of supported distros,
+  instead of silently building Fedora via the host's `ID_LIKE` fallback — so a
+  typo like `-d bubuntu` is caught rather than quietly giving you the wrong OS.
+  (An unrecognised *host* distro, with no `--distro`, still maps via `ID_LIKE`.)
+- A pinned `--release` is used verbatim in the image tag. A point release the
+  registry doesn't publish (e.g. `rocky:8.10` — Rocky ships only major tags) now
+  fails the pull with a clear explanation instead of silently using the major
+  (`rockylinux:8`, which could be any 8.x); point releases that do exist (e.g.
+  `debian:12.8`) are now honoured rather than rounded down to `debian:12`. A
+  pinned `--release` on a rolling distro (`arch`, `opensuse-tumbleweed`), which
+  has no versioned tags, is now rejected (e.g. `arch:2022` errors) instead of
+  silently returning today's `:latest`.
+
+### Fixed
+
+- `--distro` without `--release` no longer inherits the host's version for a
+  *different* distro. On a Fedora 44 host, `create -d opensuse-leap` resolved to
+  the nonexistent `opensuse/leap:44` (and other non-host distros to tags like
+  `ubuntu:44`, `rockylinux:44`); each distro now falls back to its own current
+  tag — `latest`, or a recent major for the RHEL family — and the host release
+  is used only for the host's own distro. The container name tracks the same
+  default, so it matches the image pulled (e.g. `ubuntu-toolbox-latest`). RHEL
+  also defaults to `ubiN/toolbox:latest`, as `ubiN/toolbox` has no bare `:N` tag.
+
 ## [0.4.0] - 2026-06-24
 
 ### Changed
