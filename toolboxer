@@ -938,9 +938,14 @@ SETUP
     podman exec --user root "$cname" chown "$uid:$gid" "$user_home"
 
     # Ensure sudo is installed — Fedora/RHEL toolbox images ship it, but the
-    # generic ubuntu/arch images we support via --distro don't.
-    podman exec --user root "$cname" bash -c '
-        if command -v sudo >/dev/null 2>&1; then exit 0; fi
+    # generic ubuntu/arch/openSUSE images we support via --distro don't. The block
+    # ends with `command -v sudo`, so its exit status reports whether sudo is
+    # actually present afterwards: a failed install (no network, a broken repo, or
+    # an unhandled package manager in a custom --image) is otherwise swallowed and
+    # only surfaces later as a baffling sudo error.
+    local have_sudo=false
+    if podman exec --user root "$cname" bash -c '
+        command -v sudo >/dev/null 2>&1 && exit 0
         if command -v dnf >/dev/null 2>&1; then
             dnf install -y sudo >/dev/null 2>&1
         elif command -v apt-get >/dev/null 2>&1; then
@@ -950,13 +955,21 @@ SETUP
         elif command -v zypper >/dev/null 2>&1; then
             zypper --non-interactive install sudo >/dev/null 2>&1
         fi
-    ' || true
+        command -v sudo >/dev/null 2>&1
+    '; then
+        have_sudo=true
+    else
+        echo "Warning: could not install sudo in the container; sudo will not work." >&2
+        echo "         Install it as root, or use a custom image (-i) with sudo preinstalled." >&2
+    fi
 
     # Grant passwordless sudo. Validate the drop-in with visudo so a malformed
     # file surfaces here instead of silently falling back to a password prompt.
+    # Only validate when sudo is present — visudo ships with sudo, so a sudo-less
+    # container would otherwise fail this with a misleading "did not validate".
     podman exec --user root "$cname" mkdir -p /etc/sudoers.d
     podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
-    if ! podman exec --user root "$cname" visudo -cf "/etc/sudoers.d/$user_name" >/dev/null 2>&1; then
+    if [[ "$have_sudo" == true ]] && ! podman exec --user root "$cname" visudo -cf "/etc/sudoers.d/$user_name" >/dev/null 2>&1; then
         echo "Warning: passwordless-sudo setup for '$user_name' did not validate; sudo may prompt for a password." >&2
     fi
 

@@ -743,6 +743,28 @@ PROV
     fi
     "$TOOLBOXER" rm -f "$badrel_name" >/dev/null 2>&1 || true
 
+    run_test
+    # When sudo can't be installed (a custom --image whose package manager we
+    # don't handle — here a bash-on-alpine image with only apk), setup must say so
+    # clearly rather than swallow it; and it must NOT emit the misleading sudoers
+    # "did not validate" warning (that's about a malformed file, not missing sudo).
+    # The container is still created — the failure warns, it doesn't abort.
+    nosudo_name="toolboxer-nosudo-test-$$"
+    "$TOOLBOXER" rm -f "$nosudo_name" >/dev/null 2>&1 || true
+    if "$TOOLBOXER" create -i docker.io/bash "$nosudo_name" >/dev/null 2>&1; then
+        # First start runs the user setup, which is where the warning is emitted.
+        output="$("$TOOLBOXER" run --container "$nosudo_name" true 2>&1 || true)"
+        if grep -qi "could not install sudo" <<<"$output" \
+            && ! grep -qi "did not validate" <<<"$output"; then
+            pass "missing sudo is reported clearly at setup"
+        else
+            fail "missing sudo is reported clearly at setup"
+        fi
+    else
+        fail "missing sudo is reported clearly at setup" "create from docker.io/bash failed"
+    fi
+    "$TOOLBOXER" rm -f "$nosudo_name" >/dev/null 2>&1 || true
+
     # Per-distro image tests (opt-in — these pull images). Each distro exercises
     # its own sudo-install path (dnf/apt/pacman/zypper) and the user setup on a
     # stock base image. Configure with a space-separated list of distro[:release]

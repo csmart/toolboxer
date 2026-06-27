@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- Container setup now reports clearly when `sudo` could not be installed
+  (a failed package install, or a custom `--image` whose package manager isn't
+  one toolboxer handles): it prints a "could not install sudo" warning instead of
+  silently producing a sudo-less container. The misleading "passwordless-sudo
+  setup did not validate" warning — which is about a malformed sudoers file, not
+  missing sudo — is no longer shown when the real cause is that sudo isn't there.
+
 ## [0.5.0] - 2026-06-26
 
 ### Added
