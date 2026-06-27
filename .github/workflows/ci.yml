@@ -50,13 +50,37 @@ jobs:
         # sudo-install path (dnf, apt, pacman, zypper) and the user setup. Bare
         # entries carry no release, so they test the default-release resolution
         # for a non-host distro — which must NOT inherit the host's version (no
-        # "opensuse-leap 24.04"). Pinned entries (debian:12, rocky:9, ubuntu:22.04)
+        # "opensuse-leap 24.04"). Pinned entries (debian:12, rocky:9, ubuntu:jammy)
         # additionally assert the version matches the request: debian:12/rocky:9
         # check the major, and ubuntu:jammy checks a codename end-to-end (jammy is
         # 22.04, which also differs from the 24.04 runner, proving the requested
         # version is pulled, not the host's). The opensuse/suse/leap aliases reuse
         # the already-pulled Leap image (no extra pull) to confirm canonicalisation
         # survives a real create; tumbleweed does the same for the rolling image.
+        #
+        # The whole suite is retried a couple of times: it pulls ~9 images and
+        # boots 13 containers, so a transient registry/podman hiccup can fail a run
+        # that would pass on a retry. A genuine failure still fails every attempt.
+        # Container names are PID-unique per run, so a leftover from a failed
+        # attempt can't collide with the next; each attempt is time-bounded so a
+        # hung run is killed and retried rather than eating the whole job.
+        env:
+          TOOLBOXER_TEST_DISTROS: "fedora rhel centos arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed debian:12 rocky:9 ubuntu:jammy"
         run: |
-          TOOLBOXER_TEST_DISTROS="fedora rhel centos arch opensuse-leap opensuse-tumbleweed opensuse suse leap tumbleweed debian:12 rocky:9 ubuntu:jammy" \
-            ./tests/test_toolboxer.bash
+          attempts=3
+          for i in $(seq 1 "$attempts"); do
+            echo "::group::test suite (attempt $i/$attempts)"
+            if timeout -k 30 720 ./tests/test_toolboxer.bash; then
+              echo "::endgroup::"
+              echo "passed on attempt $i"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "attempt $i failed"
+            if [ "$i" -lt "$attempts" ]; then
+              echo "retrying in 10s..."
+              sleep 10
+            fi
+          done
+          echo "all $attempts attempts failed"
+          exit 1
