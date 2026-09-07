@@ -6,14 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+
+- Selective agent sharing with `--agent NAME` and config `agents`; XDG and
+  supported agent-specific source-directory overrides.
+- Durable image-ID tracking, including base/custom images after container removal.
+- Behavioral Podman mocks, initialization/concurrency regressions, isolation tests,
+  and full-script linting. Safe unit tests cannot call the host's Podman.
+- Bounded `diagnose.sh` logs with private new output files, no config disclosure,
+  and explicitly opt-in write probes and agent-version execution.
+
+### Fixed
+
+- Error messages, unknown-option and unknown-command diagnostics, and the usage text shown for a failed command now go to stderr, keeping stdout for real output as `run` documents.
+  Explicit `--help` output stays on stdout and exit codes are unchanged.
+  Scripts that read error text from stdout must switch to stderr.
+- `create` removes the container it just created, by immutable ID and without force, when a later setup step fails or the command is interrupted, instead of leaving an orphan that blocks the next `create`.
+  The original failure or signal status is preserved and a failed cleanup is reported on stderr.
+- `list` no longer aborts when one managed image cannot be inspected.
+  An image that vanished between enumeration and inspection is skipped, any other inspection failure is reported on stderr and reflected in the exit status, and the container table is always printed.
+- A non-canonical `XDG_RUNTIME_DIR` (trailing slash, `..`, `//`) is now canonicalised once, so the container's runtime tmpfs mount, its saved label, and the exported `XDG_RUNTIME_DIR` all use the same path.
+  Previously the exported value kept the original spelling and could fail to resolve inside the container.
+- Invalid mounts fail before creation; sources are normalized and preparation
+  failures propagate. Existing files can be mounted; file-only workdirs use /tmp.
+- Existing containers retain their saved workdir; host subdirectories map through
+  the most specific actual bind mount.
+- CLI value validation, attached/equal option forms, payload parsing, conflicting
+  selectors, config precedence, and effective-release reporting.
+- Rootless execution and managed-container checks; explicit creation flags are
+  validated against existing container state.
+- Isolated mode requests private namespaces and verifies actual privileges,
+  bind mounts, and SELinux labels when available. Runtime state uses private
+  tmpfs with discrete service sockets instead of exposing the host runtime tree.
+- Use Podman-supported runtime tmpfs options; restore user ownership and mode
+  0700 before use, including after external starts and restarts.
+- Preserve host UID/GID with plain `--userns=keep-id`, avoiding redundant
+  overrides that are unsupported by older Podman releases.
+- Verified user/UID/GID and sudo setup, failure retries, safe account collision
+  handling, and container-local home repair that excludes host bind mounts.
+  Removed destructive sudo copy-up workarounds.
+- Restore verified, non-destructive sudo metadata repair for user-owned image
+  files and missing setuid bits. Preserve existing policy and reject host binds.
+- Locked initialization and once-per-request provisioning, explicit failure exit
+  codes, clean payload stdout, and legacy provisioning-state migration.
+- Keep initialization lock descriptors out of Podman/conmon so running containers
+  cannot retain setup locks indefinitely; report contention before waiting.
+- Container removal cleans anonymous volumes and reports failures. Image removal
+  protects unrelated dependents, including forced requests, and does not prune
+  unselected parent images.
+- Exact point-release test matching, safe subordinate-ID advice, completion lint,
+  and quoted install paths with PREFIX/DESTDIR support.
+
 ### Changed
 
-- Container setup now reports clearly when `sudo` could not be installed
-  (a failed package install, or a custom `--image` whose package manager isn't
-  one toolboxer handles): it prints a "could not install sudo" warning instead of
-  silently producing a sudo-less container. The misleading "passwordless-sudo
-  setup did not validate" warning — which is about a malformed sudoers file, not
-  missing sudo — is no longer shown when the real cause is that sudo isn't there.
+- Agent directories remain shared read-write, but individual agent config files
+  are creation-time snapshots, allowing atomic replacement. They are not synced
+  back to the host. Temporary snapshots are cleaned on failure/interruption.
+- Failed setup no longer marks the environment ready or executes a user command.
+  Unsupported custom images fail clearly instead of continuing without sudo.
+- Documentation describes toolbox-style compatibility and real mode limitations,
+  not universal drop-in compatibility or unconditional sandbox/SELinux guarantees.
+  Existing containers need recreation to change creation-time mounts/security.
+  Initialized legacy containers are revalidated without automatic reprovisioning.
 
 ## [0.5.0] - 2026-06-26
 

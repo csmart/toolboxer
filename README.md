@@ -1,526 +1,319 @@
 # toolboxer
 
-[![ci](https://github.com/csmart/toolboxer/actions/workflows/ci.yml/badge.svg)](https://github.com/csmart/toolboxer/actions/workflows/ci.yml)
+A Bash wrapper for local, rootless Podman development containers, with selected
+host directories instead of an automatic whole-home mount. It provides a
+toolbox-style CLI, a matching user with passwordless sudo, and optional desktop
+and AI-agent configuration sharing.
 
-A drop-in replacement for Fedora's [toolbox/toolbx](https://containertoolbx.org/) command, written in Bash. It creates Podman containers for development work but restricts volume mounts to only the directories you specify, rather than exposing your entire home directory.
+The default integrated mode is for trusted development tools. Restricting home
+mounts does **not** make a container a security sandbox.
 
-A motivating use case is **running AI coding agents without trusting them with your whole machine**. By default the container can only see the directories you mount (just `~/code`) — not the rest of your home, your SSH keys, or the wider filesystem — so an agent can work on your code without access to anything outside it. The `--ai-agents` flag then shares just each agent's own config so it runs with your existing login, and `--isolated` tightens the container further for untrusted code (see [Security model](#security-model) and [AI agents](#ai-agents)).
+## Requirements and installation
 
-## Features
+Use Linux with Bash 4.4+, GNU coreutils, awk, and util-linux's `flock`. Podman
+must already work rootlessly as your normal user. Remote Podman connections and
+running toolboxer as root are unsupported. Use `crun` to preserve supplementary
+host-group access; other runtimes produce a warning when that access may be lost.
 
-- **Restricted mounts** — only selected directories are bind-mounted into the container (default: `~/code`). Your home directory is never mounted.
-- **Full host integration** — X11, Wayland, D-Bus, SSH agent, PulseAudio, and XDG runtime dir are all passed through via discrete socket mounts.
-- **User environment** — a matching user account with sudo access is created inside the container, with your UID/GID preserved.
-- **Config sync** — `/etc/resolv.conf`, `/etc/localtime`, `/etc/hostname`, and other host config files are bind-mounted read-only. (`/etc/hosts` is left to podman, which merges your host entries and maps the container's own hostname so `sudo` doesn't stall on a DNS lookup.)
-- **Nested podman** — with `--privileged`, rootless podman-in-podman works inside the container, no host devices required (see [Running podman inside the container](#running-podman-inside-the-container)).
-- **AI agents** — `--ai-agents` shares the config of AI agent CLIs (Claude Code, Codex, Gemini, Aider, …) from your home into the container so they run with your existing login.
-- **Multiple mount directories** — pass `-m` multiple times or set `MOUNT_DIRS` (comma-separated). Each mount is `DIR` or `SRC:DEST` to land it at a custom path inside the container, like `podman -v`.
-- **Configuration file** — set persistent defaults (mounts, `--ai-agents`, `--privileged`, …) in `~/.config/toolboxer/config` instead of repeating flags (see [Configuration file](#configuration-file)).
-- **Provision script** — run a bash script in each new container on first start (and on demand) to install packages or otherwise prepare it, without maintaining a custom image (see [Provisioning](#provisioning)).
-- **toolbox-compatible CLI** — implements every user-facing `toolbox` command (`create`, `enter`, `run`, `list`, `rm`, `rmi`, `help`) and their flags, so existing `toolbox` invocations work unchanged (see [Compatibility with toolbox](#compatibility-with-toolbox)).
-- **Multi-distro** — supports Fedora, RHEL, CentOS, Rocky, Ubuntu, Debian, Arch, and openSUSE images via `--distro`/`--release`. openSUSE accepts `opensuse-leap`/`opensuse-tumbleweed`, with `opensuse`, `suse`, and `leap` aliasing Leap, `tumbleweed` aliasing Tumbleweed, and `archlinux` aliasing `arch`. Rolling distros (`arch`, `opensuse-tumbleweed`) take no `--release` — pinning one (e.g. `arch:2022`) is rejected, since there are no versioned tags. The default image **matches your host** (read from `/etc/os-release`); for a distro other than the host's, `--release` defaults to that distro's current tag (not the host's version), and is otherwise used verbatim — so a point release the registry doesn't publish (e.g. `rocky:8.10`) fails with a clear message rather than silently giving you the major. An unrecognised `--distro` (e.g. a typo) is rejected; an unrecognised **host** distro is mapped to a base via `ID_LIKE` — derivatives (Mint, Pop!_OS, Manjaro, …) to their parent, and any RHEL-family clone (AlmaLinux, etc.) to Rocky Linux (a binary-compatible image, unlike Fedora).
-- **Auto-detect** — running `toolboxer` with no command enters the default container; if only one container exists, it is used automatically (`enter`/`run`/`stop` only — `rm` needs an explicit target, like `toolbox`).
-
-## Requirements
-
-- [Podman](https://podman.io/) (rootless)
-- Bash 4.0+
-
-## Installation
-
-### Clone the repo
+The host target is any modern Linux distribution with these dependencies, not
+only the distro names supported by `--distro` (those select container images).
+Desktop integration is optional and uses the available host paths and sockets;
+SELinux handling follows Podman's reported host capabilities.
 
 ```bash
 git clone https://github.com/csmart/toolboxer.git
 cd toolboxer
-```
-
-### Quick install
-
-```bash
+make install
+# Or, without make:
 ./install.sh
 ```
 
-Or using make:
+Both install to `~/.local/bin` and the user bash-completion directory. Ensure
+`~/.local/bin` is on PATH. For another location, use
+`make install PREFIX=/your/prefix`; `DESTDIR` and `COMPDIR` are also supported.
+Uninstall using the same settings with `make uninstall`. Containers, images,
+configuration, and host files are not removed by uninstalling.
+
+A symlink to the repository's `toolboxer` script also works. Completion requires
+the host's bash-completion package; restart your shell after installation.
+
+If Podman reports a UID-mapping error, fix the host's rootless setup first.
+Toolboxer checks local `/etc/subuid` and `/etc/subgid` as a diagnostic hint, not
+as the authority for NSS-managed systems. Ask the administrator to allocate
+sufficient, **non-overlapping** subordinate ranges for your account. Do not copy
+another user's range or recursively change container-storage ownership. Changing
+mappings may require Podman migration/recreation and coordination with running
+workloads.
+
+## Getting started
 
 ```bash
-make install
+toolboxer create -d ubuntu -r 24.04 -m ~/code/project:/work dev
+toolboxer enter dev
+toolboxer run -c dev make test
+toolboxer stop dev
+toolboxer rm dev
 ```
 
-To uninstall:
+With no command, toolboxer defaults to `enter`. It uses the configured/default
+container, or the sole toolboxer container if no name, distro, or release was
+explicitly selected. Only `enter` offers to create a missing container;
+`-y` accepts that prompt. Explicit selections never fall back to another name.
+
+`create` creates a stopped container. First use starts it and initializes the
+matching account, writable container-local home, passwordless sudo, and profile.
+Setup is checked before recording success and retried after a failure. The idle
+process runs as container root; user commands run with your host UID/GID and
+explicit HOME. Both login shells and `run` expose `~/.local/bin`.
+
+If sudo's image files appear user-owned or lack setuid, setup repairs root
+ownership and safe permissions on the container-local executable, configuration,
+and direct sudoers fragments. It preserves their contents, does not delete or
+recursively rebuild directories, and refuses repairs through host bind mounts.
+Metadata and passwordless sudo are verified before setup is marked complete.
+This does not repair the host's container storage or UID/GID allocation.
+
+Concurrent setup and provisioning are serialized per container. A contended
+invocation prints a lock-wait message; Ctrl-C cancels the waiter. Older versions
+could leak the lock to the container monitor (`conmon`), making subsequent
+`enter`, `run`, or `provision` commands wait indefinitely. After updating, cancel
+blocked invocations and save any work in the affected container, then run
+`podman stop NAME` and retry with the updated script. Stopping ends running
+container processes but preserves the container and its files. Do not delete
+the lock file: that could allow simultaneous setup against different locks.
+
+`run` preserves payload stdout and exit status; setup and provisioning output go
+to stderr. Wrapper options end at the command, so its arguments are not reparsed.
+It does not source login profiles. Use `run -c dev bash -lc '...'` when needed.
+`--preserve-fds N` forwards additional inherited descriptors where supported by
+the installed Podman/runtime.
+
+## Mounts and working directories
+
+The default mount is `~/code`. Each `-m/--mount` is either `PATH` (same path
+inside) or `SOURCE:/absolute/target`. CLI mounts replace the default/configured
+list rather than adding to it. Repeated flags support paths containing spaces:
 
 ```bash
-make uninstall
+toolboxer create -m "$HOME/work project:/work" -m "$HOME/.gitconfig:/etc/gitconfig" dev
+MOUNT_DIRS="$HOME/code,$HOME/documents:/docs" toolboxer create docs
 ```
 
-### Option 1: Symlink into a directory already on your PATH
+Sources are resolved to absolute paths. Missing sources are created as directories;
+create a file yourself before mounting it as a file. Destinations must be absolute.
+Empty/invalid specs, duplicate targets, mounts over `/`, and tabs/newlines are
+rejected. This is not Podman's full volume-option syntax: `:ro`, `:Z`, named
+volumes, and colon-containing paths are not accepted. Commas delimit lists; use
+repeated CLI flags for paths containing commas.
 
-```bash
-ln -s "$(pwd)/toolboxer" ~/.local/bin/toolboxer
-```
+The first **directory** target is saved as the container workdir; file-only
+mounts use `/tmp`. On later `run`/`enter`, a host cwd inside a mounted directory
+maps to its corresponding container path, using the most specific mount.
+Otherwise the saved workdir is used, independent of the current config.
 
-### Option 2: Copy it directly
+Mounts are read-write. Toolboxer repairs ownership only in the container-local
+home, pruning bind-mounted paths. Host bind sources remain after container removal.
+A directly bind-mounted file cannot reliably be replaced using an atomic rename;
+mount its parent directory when you need that behavior, considering the additional
+files this exposes.
 
-```bash
-cp toolboxer ~/.local/bin/toolboxer
-chmod +x ~/.local/bin/toolboxer
-```
+## Modes and security
 
-### Option 3: Custom location
+| Mode | Namespaces and host integration | SELinux |
+| --- | --- | --- |
+| Default | Host network, PID and IPC; selected desktop/service sockets and host configuration | Container labeling disabled |
+| `--privileged` | Integrated mode with additional privileges/devices for trusted nested-container workloads | Container labeling disabled |
+| `--isolated` | Private network, PID, IPC and UTS; init process; no automatic host-service mounts | Requests `container_t` when enabled; mounts relabeled with shared `:z` |
 
-If you place `toolboxer` somewhere that isn't on your `PATH`, add that directory:
+Integrated mode forwards available X11, Wayland, D-Bus, SSH-agent and audio
+connections. It also mounts selected host configuration, journal and udev paths.
+The runtime directory itself is a private tmpfs; toolboxer no longer automatically
+binds the entire host runtime directory or the host Podman socket. Socket paths
+and environment are captured at creation; recreate after incompatible session
+changes.
 
-```bash
-# Add to ~/.bashrc or ~/.bash_profile
-export PATH="$PATH:/path/to/toolboxer/directory"
-```
+These services confer real authority. SSH-agent access permits authentication,
+D-Bus/X11 expose desktop capabilities, and host namespaces expose host processes
+and services. Treat integrated and privileged containers as trusted host tools.
+The narrower mount list is a convenience, not a protection against malicious code.
 
-Then reload your shell:
+Isolated mode checks the saved mode, privileges, namespace settings, process label
+when applicable, and actual bind mounts before use. Unexpected bind mounts from
+Podman configuration cause an error. It is **not offline**, it shares the host
+kernel, and writable mounts remain writable. SELinux is only effective when the
+host enables and enforces it; on disabled/permissive hosts there is no enforcing
+SELinux boundary. Relabeling alters host labels and may affect other services:
+`:z` recursively relabels each shared tree, so isolated create fails on any file
+you do not own, and with `--agent`/`-A` it relabels your live agent credential
+directories too. Do not share credentials or sensitive mounts with untrusted
+code. Use a separate VM for workloads requiring a stronger boundary.
 
-```bash
-source ~/.bashrc
-```
+These behaviors build on [Podman's namespace, volume and privilege options](https://docs.podman.io/en/latest/markdown/podman-create.1.html).
+Toolboxer does not audit every possible host policy, image hook, or runtime setting.
 
-### Installing bash completion
+Creation settings cannot reconfigure an existing container. Explicit incompatible
+mode/agent flags or absent requested mounts fail with a recreation message.
+Existing containers retain their original mounts and privileges: recreate older
+containers to get runtime-mount changes. Legacy containers claiming isolation but
+lacking the new validation metadata may also need recreation. Back up useful
+container-local files before removing them.
 
-Copy the completion file to the system or user completions directory:
+A configured `isolated = true` is enforced when you enter or run an existing container: it must be an isolated container or the command fails.
+A configured `privileged = true` is not enforced that way; only an explicit `--privileged`, `--no-privileged`, or `--no-isolated` on the command line is checked against an existing container.
+This keeps a configured isolation boundary from being bypassed silently, while leaving privileged a per-command choice.
 
-```bash
-# System-wide (requires root)
-sudo cp completions/toolboxer.bash /etc/bash_completion.d/toolboxer
+For nested Podman, explicitly select `--privileged` and install Podman inside
+the container. Toolboxer configures nested networking to use the outer container's
+network. Nested storage stays in the container home unless you explicitly mount
+it. Nested containers still depend on the host's kernel, mapping, cgroup, and
+storage support; privileged mode is not a universal compatibility guarantee.
 
-# Or user-local
-mkdir -p ~/.local/share/bash-completion/completions
-cp completions/toolboxer.bash ~/.local/share/bash-completion/completions/toolboxer
-```
+## Images and commands
 
-Then start a new shell or source it manually:
+Supported distro keys are `fedora`, `rhel`, `centos`, `rocky`, `ubuntu`,
+`debian`, `arch`, `opensuse-leap`, and `opensuse-tumbleweed`. Aliases:
+`opensuse/suse/leap` select Leap, `tumbleweed` selects Tumbleweed, and
+`archlinux` selects Arch. Unknown explicit distros are rejected.
 
-```bash
-source completions/toolboxer.bash
-```
+The host distro/release determines defaults; RHEL-family and Debian hosts default
+to their major version instead of a point-release tag. Non-host distros generally use
+`latest`, while the RHEL family defaults to major 9. Derivative-host detection
+uses `ID_LIKE`; specify a known distro and release for predictable selection.
+Explicit releases are not silently rounded or substituted on pull failure.
+Rolling distros accept only `latest`. RHEL maps major N to `ubiN/toolbox:latest`
+and point N.M to `ubiN/toolbox:N.M`; CentOS uses `centos:streamN`.
 
-## Usage
+Use `create --image IMAGE NAME` for a custom image; it conflicts with explicit
+distro/release flags. Images must supply Bash, standard GNU/Linux account tools
+(`getent`, `groupadd`, `useradd`, `usermod`), standard filesystem utilities,
+and `sleep infinity`. Sudo must be installed already or installable through
+dnf, apt, pacman, or zypper. Arch installation performs a full upgrade rather
+than a partial package upgrade. Unsupported minimal images fail setup clearly.
+The image entrypoint is replaced; application-specific initialization is not run.
 
-```
-toolboxer [--mount DIR] <command> [args...]
-```
+`list` shows containers labeled `toolboxer=true` and tracked images.
+`list -c` and `list -i` select sections; together they show both.
+Images are tracked by immutable ID under `$XDG_STATE_HOME/toolboxer/images`
+(default `~/.local/state/toolboxer/images`), supplemented by existing managed
+containers. Thus base/custom images remain discoverable after removing their
+containers. Images orphaned before tracking was introduced need explicit names.
 
-Running `toolboxer` with no command defaults to `enter`.
+`rm` requires explicit names, distro/release selectors, or `--all`; a bare
+command never removes a default target. It removes anonymous volumes with the
+container, but not host sources or named volumes. Running containers need `-f`.
+`rmi IMAGE...` targets explicit local images; `rmi --all` selects only tracked
+IDs. Force removes dependent **toolboxer** containers, but refuses images used
+by unrelated containers. It never forwards Podman's broad forced-image deletion;
+see [Podman's force semantics](https://docs.podman.io/en/latest/markdown/podman-rmi.1.html).
+Failures return nonzero. Neither command silently reports failed removals as success.
 
-### Commands
+See `toolboxer help COMMAND` for individual options. Toolboxer is not a complete
+drop-in for Toolbx: it does not implement every flag, lifecycle hook, or internal
+command, and does not adopt arbitrary existing Toolbx/Podman containers.
 
-| Command | Description |
-|---------|-------------|
-| `create` | Create the container |
-| `enter` | Enter the container (starts it if stopped) |
-| `run <cmd>` | Run a single command inside the container |
-| `list` | Show all toolboxer containers and images |
-| `stop` | Stop the container |
-| `rm` | Remove the container(s) |
-| `rmi` | Remove toolbox image(s) |
-| `config` | Show the effective configuration (config file + flags) |
-| `provision [CONTAINER]` | Re-run the [provision script](#provisioning) in a container |
-| `help` | Show help |
+## Configuration and provisioning
 
-### `create` options
-
-| Option | Description |
-|--------|-------------|
-| `-d`, `--distro DISTRO` | Use a different distro (incompatible with `--image`) |
-| `-i`, `--image NAME` | Use a custom image (incompatible with `--distro`/`--release`) |
-| `-r`, `--release RELEASE` | Use a different release (incompatible with `--image`) |
-| `-m`, `--mount SPEC` | Mount `DIR`, or `SRC:DEST` for a custom target (repeatable) |
-| `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
-| `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
-| `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)); incompatible with `--privileged` |
-| `[CONTAINER]` | Container name (positional) |
-
-`-A`/`--privileged`/`--isolated` each have a `--no-…` form (`--no-ai-agents`, `--no-privileged`, `--no-isolated`) to switch off a default set in the [config file](#configuration-file).
-
-### `enter` options
-
-| Option | Description |
-|--------|-------------|
-| `-d`, `--distro DISTRO` | Enter container for a different distro |
-| `-r`, `--release RELEASE` | Enter container for a different release |
-| `[CONTAINER]` | Container name (positional) |
-
-### `run` options
-
-| Option | Description |
-|--------|-------------|
-| `-c`, `--container NAME` | Run in a specific container |
-| `-d`, `--distro DISTRO` | Run in container for a different distro |
-| `-r`, `--release RELEASE` | Run in container for a different release |
-
-### `list` options
-
-| Option | Description |
-|--------|-------------|
-| `-c`, `--containers` | Show only containers |
-| `-i`, `--images` | Show only images |
-
-### `rm` options
-
-| Option | Description |
-|--------|-------------|
-| `-a`, `--all` | Remove all toolboxer containers |
-| `-f`, `--force` | Force removal of running containers |
-| `-d`, `--distro DISTRO` | Remove the container for a different distro |
-| `-r`, `--release RELEASE` | Remove the container for a different release |
-| `[CONTAINER...]` | Container name(s) (positional) |
-
-`rm` needs an explicit target — a name, `--all`, or `-d`/`-r` (which resolve the name, so `toolboxer rm -r 44` removes `fedora-toolbox-44`). A bare `toolboxer rm` is an error, matching `toolbox`: **unlike `enter`/`run`/`stop`, `rm` never falls back to the host-default or the only existing container**, so it can't remove one you didn't name.
-
-### `rmi` options
-
-| Option | Description |
-|--------|-------------|
-| `-a`, `--all` | Remove all toolbox images |
-| `-f`, `--force` | Force removal, including dependent containers |
-| `[IMAGE...]` | Image name(s) (positional) |
-
-### Global options
-
-| Option | Description |
-|--------|-------------|
-| `-m`, `--mount SPEC` | Mount `DIR`, or `SRC:DEST` for a custom target — repeatable (default: `~/code`) |
-| `-A`, `--ai-agents` | Also mount AI agent config dirs found in `$HOME` (see [AI agents](#ai-agents)) |
-| `-y`, `--assumeyes` | Assume yes to prompts (e.g. auto-create on `enter`) |
-| `--privileged` | Run privileged (needed for nested podman/docker); reduces isolation (see [Security model](#security-model)) |
-| `--isolated` | Hardened sandbox for untrusted code (see [Security model](#security-model)) |
-| `-h`, `--help` | Show help |
-
-Each on/off global has a `--no-…` form (`--no-ai-agents`, `--no-assumeyes`, `--no-privileged`, `--no-isolated`) to override a default enabled in the [config file](#configuration-file).
-
-### Environment variables
-
-These override the config file but are themselves overridden by CLI flags.
-
-| Variable | Description |
-|----------|-------------|
-| `CONTAINER_NAME` | Container name |
-| `IMAGE` | Image to use |
-| `MOUNT_DIRS` | Comma-separated list of mounts (`DIR` or `SRC:DEST` each) |
-
-### Configuration file
-
-Persistent defaults live in a simple `key = value` file, so you don't have to repeat flags on every invocation. Settings resolve by precedence:
-
-```
-CLI flags  >  environment variables  >  config file  >  built-in defaults
-```
-
-The file is read from `$TOOLBOXER_CONFIG`, else `$XDG_CONFIG_HOME/toolboxer/config`, else `~/.config/toolboxer/config`. Lines are `key = value` (or `key value`); `#` starts a comment; blank lines are ignored.
+Configuration is read from `$TOOLBOXER_CONFIG`, otherwise
+`$XDG_CONFIG_HOME/toolboxer/config`, otherwise `~/.config/toolboxer/config`.
+Precedence is CLI flags > environment > config > built-in defaults.
 
 ```ini
-# ~/.config/toolboxer/config
-mount      = ~/code          # repeat the line, or comma-separate, for several
-mount      = ~/data:/data    # SRC:DEST mounts at a custom target path
-ai_agents  = true            # mount AI agent logins by default (-A)
-privileged = true            # run privileged by default
+mount = ~/code/project:/work
+agents = codex,claude
+isolated = true
+distro = ubuntu
+release = 24.04
+container_name = coding
+provision_script = ~/.config/toolboxer/provision.sh
 ```
 
-| Key | Type | Equivalent flag |
-|-----|------|-----------------|
-| `mount` | `DIR` or `SRC:DEST` (repeatable / comma-separated) | `-m`/`--mount` |
-| `ai_agents` | bool | `-A`/`--ai-agents` |
-| `assumeyes` | bool | `-y`/`--assumeyes` |
-| `privileged` | bool | `--privileged` |
-| `isolated` | bool | `--isolated` |
-| `image` | string | `-i`/`--image` |
-| `distro` | string | `-d`/`--distro` |
-| `release` | string | `-r`/`--release` |
-| `container_name` | string | `CONTAINER_NAME` |
-| `authfile` | path | `--authfile` |
-| `provision_script` | path | — (see [Provisioning](#provisioning)) |
+Other keys: `image`, `authfile`, `ai_agents`, `assumeyes`, and `privileged`.
+Mount keys can repeat or contain comma-separated lists. Leading `~` expands;
+this is not shell code and does not expand arbitrary variables or commands.
+`#` starts a comment; quote a value (`"..."` or `'...'`) to keep a literal `#`.
+Boolean options accept true/false, yes/no, on/off, 1/0;
+CLI `--no-...` overrides a config boolean. `IMAGE`, `CONTAINER_NAME`, and
+`MOUNT_DIRS` override corresponding config values. `toolboxer config` shows
+effective settings without contacting Podman or creating mounts.
 
-Booleans accept `true`/`false` (also `yes`/`no`, `on`/`off`, `1`/`0`). A value set in the config file can be turned off for a single run with the matching `--no-…` flag (e.g. `--no-privileged`). Run `toolboxer config` to see exactly how the settings resolved:
+The provision script is chosen by `$TOOLBOXER_PROVISION`, then
+`provision_script`, then `provision.sh` beside the config file. For example:
 
 ```bash
-$ toolboxer config
-Config file: /home/you/.config/toolboxer/config (loaded)
-Effective settings (config file < env vars < CLI flags):
-  mount       /home/you/code
-  ai_agents   true
-  ...
-```
-
-### Examples
-
-```bash
-# Create and enter a default container (mounts ~/code)
-toolboxer create
-toolboxer enter
-
-# Just run toolboxer with no args to enter the default container
-toolboxer
-
-# Create with a custom image
-toolboxer create --image fedora:41
-
-# Create a container for a different distro/release
-toolboxer create --distro ubuntu --release 24.04
-
-# Create a container that mounts two directories
-toolboxer -m ~/code -m ~/documents create
-
-# Create a container that also shares your AI agent logins (claude, codex, …)
-toolboxer --ai-agents create
-
-# Give the container a custom name
-toolboxer create my-project
-
-# Enter a specific container by name
-toolboxer enter my-project
-
-# Run a single command
-toolboxer run gcc -o hello hello.c
-
-# Run in a specific container
-toolboxer run --container my-project make test
-
-# List all toolboxer containers and images
-toolboxer list
-
-# List only containers (no images)
-toolboxer list --containers
-
-# Show how settings resolve (config file < env vars < CLI flags)
-toolboxer config
-
-# Stop and remove
-toolboxer stop
-toolboxer rm
-
-# Remove a specific container
-toolboxer rm my-project
-
-# Remove all containers (including running ones)
-toolboxer rm --all --force
-
-# Remove all toolbox images
-toolboxer rmi --all
-```
-
-## Provisioning
-
-toolboxer uses **stock distro images**, so a fresh container only has what the base image ships. A provision script lets you prepare each new container — install packages, drop in config — without building and maintaining your own image.
-
-The script is a **bash** script, resolved (first match wins) from:
-
-1. `$TOOLBOXER_PROVISION`
-2. `provision_script` in the [config file](#configuration-file)
-3. `provision.sh` next to the config file (e.g. `~/.config/toolboxer/provision.sh`)
-
-If none exists, provisioning is simply skipped. It runs **once, on a container's first start** (right after the built-in user setup), and on demand with `toolboxer provision [CONTAINER]` — handy after you edit the script, or for a container created before it existed.
-
-It runs **as you**, with passwordless `sudo` available, and is executed with bash (the shebang is ignored). The container's distro and release are exported as `TOOLBOXER_DISTRO` and `TOOLBOXER_RELEASE` so you can branch on them. A failure only warns — the container stays usable, and you can re-run with `toolboxer provision`.
-
-```bash
-# ~/.config/toolboxer/provision.sh
+#!/usr/bin/env bash
+set -euo pipefail
 case "$TOOLBOXER_DISTRO" in
-    fedora|rhel|centos|rocky) sudo dnf install -y git ripgrep fd-find ;;
-    ubuntu|debian)            sudo apt-get update && sudo apt-get install -y git ripgrep fd-find ;;
-    arch)                     sudo pacman -Sy --noconfirm git ripgrep fd ;;
+    ubuntu|debian)
+        sudo apt-get update
+        sudo apt-get install -y git make
+        ;;
 esac
 ```
 
-> **When to use a custom image instead.** A provision script re-runs its installs on *every* new container, so it's best for the occasional container and a modest set of packages. For anything heavy, slow, or that must be fast and reproducible, build your own image (a `Containerfile`/`Dockerfile`) once and use it with `-i`/`--image` — that bakes everything into the image and starts instantly.
+It runs under Bash as the matching user, with sudo available. Its shebang is
+ignored; set your own failure policy. `TOOLBOXER_DISTRO` and
+`TOOLBOXER_RELEASE` describe the actual container image. New containers provision
+on first use, once after success; failed automatic attempts warn and retry next
+time. `toolboxer provision NAME` reruns once explicitly and fails if the script
+is missing or fails. Concurrent first starts serialize initialization.
 
-## Host integration
+Upgrading an initialized legacy container revalidates account/sudo setup, but
+does not automatically rerun its old provision script. Legacy success cannot be
+reconstructed; use explicit provisioning if needed. Adding a script after a
+container has initialized also requires an explicit provision request.
 
-The following host resources are passed into the container automatically (none of these require mounting `$HOME`):
+## AI-agent configuration
 
-| Resource | Mount | Mode |
-|----------|-------|------|
-| DNS, hostname, timezone | `/etc/resolv.conf`, `/etc/hosts`, `/etc/localtime`, etc. | read-only |
-| X11 display | `/tmp/.X11-unix` | read-only |
-| Wayland, PulseAudio | `$XDG_RUNTIME_DIR` | read-write |
-| D-Bus session bus | `$DBUS_SESSION_BUS_ADDRESS` socket | read-write |
-| SSH agent | `$SSH_AUTH_SOCK` socket | read-write |
-| systemd journal | `/run/systemd/journal` | read-only |
-| udev database | `/run/udev/data` | read-only |
-| FUSE / TUN devices | `/dev/fuse`, `/dev/net/tun` | device (if present) |
-
-Environment variables (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, `TERM`, `LANG`, `XDG_RUNTIME_DIR`) are forwarded into the container.
-
-## Running podman inside the container
-
-Create the container with `--privileged` and rootless **podman-in-podman** works
-inside it, with **no required host devices**:
+Use `--agent NAME` repeatedly to select only the configurations you want:
 
 ```bash
-toolboxer create --privileged
-toolboxer run podman run hello-world
+toolboxer create --agent codex --agent claude -m ~/code/project:/work coding
 ```
 
-`--privileged` reduces isolation (see [Security model](#security-model)), so
-it's opt-in. With it, the setup needs the fewest possible host requirements:
+Names: `claude codex gemini qwen cursor grok continue copilot goose opencode crush
+aider llm sgpt interpreter`. `-A/--ai-agents` without a configured selection
+shares all supported paths. A config `agents = codex,claude` both selects and
+enables sharing; `--no-ai-agents` disables it.
 
-- **Networking** — on first start, toolboxer drops a containers.conf drop-in
-  (`/etc/containers/containers.conf.d/90-toolboxer-nested.conf`) that defaults
-  the nested podman to **host networking** (`netns=host`). Because the toolbox
-  itself already runs with `--network host`, nested containers share the host
-  network and need no `/dev/net/tun` (so no pasta/slirp4netns, and no `tun`
-  kernel module). Override per-container with `podman run --network pasta …` if
-  you have `/dev/net/tun` available.
-- **Storage** — on a modern kernel, the nested podman uses native rootless
-  overlay, so `/dev/fuse` isn't required. `--privileged` also exposes the host
-  devices (including `/dev/fuse` and `/dev/net/tun`), so fuse-overlayfs and
-  bridged/pasta networking work if you opt back into them.
-- **Capabilities** — `--privileged` is what makes nested podman work. In
-  *rootless* podman it grants no real host privilege (the container stays
-  confined to your rootless user namespace); it just gives the container the
-  capabilities you already have and unmasks `/proc`. Without it, the nested
-  podman — which falls back to single-UID mapping here (no subuid ranges) and
-  so inherits toolboxer's capped-down set — fails privileged-in-userns
-  operations such as mounting a fresh `procfs` (`crun: mount proc: Operation
-  not permitted`) and `sethostname`. This is the same approach
-  [distrobox](https://github.com/89luca89/distrobox) takes.
-- **Runtime isolation** — toolboxer bind-mounts your `$XDG_RUNTIME_DIR` (for
-  the Wayland/PulseAudio/D-Bus sockets), but shadows podman's own state dirs
-  inside it (`$XDG_RUNTIME_DIR/containers` and `.../libpod`) with empty
-  container-local volumes. This keeps the nested podman's runroot and
-  pause-process pid file separate from the host's. Without it, the nested
-  podman would overwrite the host's `…/libpod/tmp/pause.pid` with a pause
-  process living in the container's mount namespace, and — because the toolbox
-  runs with `--pid host` — subsequent **host** podman commands would join that
-  namespace and break with `stat …/.config: no such file or directory` until
-  the pause process was killed. (Trade-off: nested podman does not see host
-  registry logins, since `auth.json` lives under the shadowed `containers`
-  dir — run `podman login` again inside the toolbox for private registries.)
+Selected config/data **directories** are bind-mounted read-write; missing ones
+are created on the host so logins persist. Individual files such as
+`.claude.json` and Aider configuration are private **creation-time snapshots**.
+They support atomic replacement inside the container, but changes are not synced
+back and are lost on removal unless exported first. Missing individual files
+are skipped. Explicit mounts covering those paths take precedence.
 
-Note on user namespaces: the in-container user does not have its own
-`/etc/subuid`/`/etc/subgid` ranges, so the nested podman falls back to
-*single-UID mapping* (everything runs as your UID). This is fine for most
-images. Images that need multiple UIDs inside (e.g. that create and switch to a
-separate user) require subuid/subgid ranges, which interact with
-`--userns=keep-id` and are deliberately not configured automatically.
+Source discovery honors `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `CODEX_HOME`, and
+`CLAUDE_CONFIG_DIR`; targets use normal paths under the container home.
+Agents themselves must be installed inside the container. Paths are conventions,
+not guaranteed support for every version or authentication method. Sharing grants
+access to stored credentials and sessions; select narrowly and trust the container.
 
-## AI agents
+## Diagnostics and tests
 
-Pass `-A`/`--ai-agents` to `create` (or as a global option) to bind-mount the
-config/data directories of AI agent CLIs found in your home into the container
-at the **same paths**, read-write. Because the container's `$HOME` matches the
-host's (and is otherwise unmounted) and `--userns=keep-id` preserves your UID,
-each agent finds its config exactly where it expects and shares your existing
-host login, settings, and sessions:
+`./diagnose.sh CONTAINER` collects a private, uniquely named log beside the
+script. Use `-o NEW_FILE` to choose a new path; existing files are never overwritten.
+Default checks avoid login profiles, credential/config dumps, agent execution,
+and write probes. `--write-probes` creates/removes temporary probe files;
+`--agent-versions` executes installed agent code. Podman commands are time-bounded.
+Logs still include usernames, paths, process/mount metadata, and command output:
+review before sharing. Stopped containers are inspected without starting them.
 
 ```bash
-toolboxer --ai-agents create
-toolboxer run claude     # uses your host login, no re-auth
+make test                 # Safe unit/regression tests; never calls real Podman
+make lint                 # ShellCheck plus Bash syntax checks
+./tests/test_toolboxer.sh  # Live integration; pulls images and creates containers
+./tests/test_isolation.sh # Live isolation/workdir/concurrency and integrated-runtime regressions
 ```
 
-Only directories that exist are mounted, so it's safe regardless of which agents
-you have installed. The agent **CLI binary itself is not mounted** — install it
-inside the container (or in a mounted directory) as usual; this flag only shares
-its configuration. Recognised agents include Claude Code (`~/.claude`),
-OpenAI Codex (`~/.codex`), Gemini CLI (`~/.gemini`), Qwen Code, Cursor, Grok,
-Continue, GitHub Copilot CLI, Goose, OpenCode, Crush, Aider, `llm`, Shell-GPT,
-and Open Interpreter. The list lives in `AI_AGENT_PATHS` near the top of the
-`toolboxer` script — add new agents there.
-
-## Security model
-
-toolboxer's main protection is the **mount boundary**: a container can only see
-the directories you mount into it. Your home, SSH keys, and the rest of the
-filesystem aren't mounted, so they're simply absent from the container — and
-**this holds in every mode**. It's what makes the tool useful for running an AI
-agent on your code without exposing the rest of your machine.
-
-What the default container does *not* do is harden against a malicious process
-trying to **break out**. Like `toolbox`, it runs with SELinux disabled for the
-container (`--security-opt label=disable`, which is required so it can read host
-files like `/etc/resolv.conf` and the X11/D-Bus/SSH sockets) and shares the host
-network, PID, and IPC namespaces. That's fine for your own code; it is not an
-escape-proof sandbox.
-
-Two flags adjust the trade-off (they are mutually exclusive):
-
-| | default | `--privileged` | `--isolated` |
-|-|---------|----------------|--------------|
-| Files visible | only your mounts | only your mounts | only your mounts |
-| SELinux | off for container | off for container | **confined** |
-| Namespaces | host net/pid/ipc | host net/pid/ipc | **private** |
-| Host integration (GUI, DNS, sockets) | yes | yes | **no** |
-| `--privileged` | no | **yes** | no |
-| Internet access | yes | yes | yes (podman netns) |
-| Nested podman/docker | no | **yes** | no |
-
-- **`--privileged`** *loosens* isolation, and only exists to run podman/docker
-  inside the container. Don't use it for code you don't trust.
-- **`--isolated`** *tightens* it: SELinux-confined, private namespaces, no host
-  integration, and only your (relabeled) mounts — the right choice for running
-  something untrusted. It still reaches the internet via podman's own
-  networking, so an agent's API calls work, but there's no GUI, host DNS, or
-  nested podman. Note `:z` relabeling fails on files in the mount owned by
-  another user, so the mounted tree must be yours.
-
-## Testing
-
-Run the smoke tests:
-
-```bash
-./tests/test_toolboxer.bash
-```
-
-CLI tests run without Podman. Integration tests (create, run, sudo, rm) require a working rootless Podman setup.
-
-## Linting
-
-```bash
-shellcheck toolboxer
-```
-
-## Compatibility with toolbox
-
-toolboxer aims to be a drop-in replacement: every **user-facing** `toolbox`
-command and flag is implemented, so existing invocations and muscle memory work
-unchanged. It also adds extras of its own.
-
-### Commands
-
-| `toolbox` | `toolboxer` | Notes |
-|-----------|:---------:|-------|
-| `create` | ✅ | plus `-m/--mount`, `-A/--ai-agents` |
-| `enter` | ✅ | |
-| `run` | ✅ | |
-| `list` | ✅ | |
-| `rm` | ✅ | plus `-d/--distro`, `-r/--release` |
-| `rmi` | ✅ | |
-| `help` | ✅ | |
-| `init-container` | n/a | Internal `toolbox` container entrypoint, never run by users; toolboxer sets the user up via `useradd`/sudoers on first start instead. |
-| — | `stop` | toolboxer extra |
-| — | `config` | toolboxer extra — show the effective configuration |
-| — | `provision` | toolboxer extra — re-run the provision script |
-
-### Flags
-
-All `toolbox` per-command flags are implemented — `create` (`-d`/`-i`/`-r`/`--authfile`),
-`enter` (`-d`/`-r`), `run` (`-c`/`-d`/`-r`/`--preserve-fds`), `list` (`-c`/`-i`),
-`rm` (`-a`/`-f`), `rmi` (`-a`/`-f`) — plus the globals `-y`/`--assumeyes` and `-h`/`--help`.
-
-**Not implemented:** the debugging/logging globals `-v`/`--verbose`, `--log-level`,
-and `--log-podman`. toolboxer is a Bash script, so run it with `bash -x` for
-tracing instead.
-
-**toolboxer extras:** global `-m`/`--mount`, `-A`/`--ai-agents`, `--privileged`
-and `--isolated` (each with a `--no-…` form); `-d`/`-r` on `rm` and `stop`; the
-`stop`, `config`, and `provision` commands; and a [config file](#configuration-file)
-for persistent defaults plus an optional [provision script](#provisioning).
-
-## How it differs from toolbox
-
-| | `toolbox` | `toolboxer` |
-|-|-----------|-------------|
-| Home directory | Entire `$HOME` mounted | Only specified directories mounted |
-| Host integration | Full | Full (X11, Wayland, D-Bus, SSH, DNS, etc.) |
-| User setup | Via init-container | Via `useradd` + sudoers on first `enter`/`run` |
-| Implementation | Go binary | Single Bash script |
-| Container label | `com.github.containers.toolbox` | `toolbox=true` + `toolboxer=true` |
+Python 3.9+ is required for regression tests, and ShellCheck for linting. The live
+tests require working rootless Podman and use temporary fixtures. Pulled images
+are retained. CI is configured to run the supported container-image matrix on
+a single Ubuntu 24.04 host with its packaged Podman, without retrying entire
+failed suites. This is not a cross-distribution host certification: Fedora,
+Debian, Arch, openSUSE, and other hosts need live runs too. Run isolation tests on
+an enforcing SELinux host as well as a non-SELinux host; Ubuntu-only CI cannot
+validate enforcement.
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+MIT — see [LICENSE](LICENSE).
