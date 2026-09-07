@@ -3,8 +3,17 @@
 # Requires podman to be installed and working (rootless)
 set -euo pipefail
 
+# Unit tests must never reach the host's Podman, including EXIT cleanup.
+# Only the explicitly selected integration section restores the real command.
+podman() { return 127; }
+export -f podman
+export TOOLBOXER_CONFIG=/dev/null TOOLBOXER_PROVISION=/nonexistent/toolboxer-provision
+unset CONTAINER_NAME IMAGE MOUNT_DIRS
+
 TOOLBOXER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/toolboxer"
-TEST_NAME="toolboxer-test-$$"
+TEST_SUFFIX="$-$RANDOM-$RANDOM"
+TEST_NAME="toolboxer-test-$TEST_SUFFIX"
+TEST_CONTAINERS=()
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
@@ -34,26 +43,33 @@ run_test() {
     ((TESTS_RUN++)) || true
 }
 
-# Does a container's os-release (VERSION_ID $1, VERSION_CODENAME $2) satisfy the
-# requested release $3? A named request matches the codename (ubuntu:jammy ->
-# VERSION_CODENAME=jammy, debian:bookworm -> bookworm). A numeric request matches
-# on the major version: image tags rarely pin a point release (rockylinux:8 is
-# whatever 8.x is current, debian:12 carries no minor, and there's no
-# rockylinux:8.10 tag), so the major is the honest precision — it still catches a
-# wrong version (rocky 8 vs 9, ubuntu 22.04 vs 24.04) without flaking on the
-# floating minor. An exact VERSION_ID match short-circuits (ubuntu:22.04 -> 22.04).
+# Exact point releases and codenames must match. Integer requests allow the
+# floating minor of that major (e.g. Rocky 9 -> 9.3).
 release_matches() {
     local cver="$1" ccode="$2" req="$3"
     if [[ "$cver" == "$req" ]] \
         || [[ -n "$ccode" && "$ccode" == "$req" ]] \
-        || [[ "$req" == [0-9]* && "${cver%%.*}" == "${req%%.*}" ]]; then
+        || [[ "$req" =~ ^[0-9]+$ && "${cver%%.*}" == "$req" ]]; then
         return 0
     fi
     return 1
 }
 
+reserve_test_name() {
+    local name="$1" status=0
+    podman container exists "$name" || status=$?
+    if [[ "$status" != 1 ]]; then
+        echo "Cannot reserve test name '$name' (exists or Podman unavailable)." >&2
+        exit 1
+    fi
+    TEST_CONTAINERS+=("$name")
+}
+
 cleanup() {
-    podman rm -f "$TEST_NAME" >/dev/null 2>&1 || true
+    local name
+    for name in "${TEST_CONTAINERS[@]}"; do
+        podman rm --force --volumes "$name" >/dev/null 2>&1 || true
+    done
 }
 trap cleanup EXIT
 
@@ -61,35 +77,44 @@ trap cleanup EXIT
 echo "=== CLI tests (no podman needed) ==="
 
 run_test
-if "$TOOLBOXER" --help 2>&1 | grep -q "Commands:"; then
+if output="$("$TOOLBOXER" --help 2>&1)" && grep -q "Commands:" <<< "$output"; then
     pass "--help shows usage"
 else
     fail "--help shows usage"
 fi
 
 run_test
-if "$TOOLBOXER" help 2>&1 | grep -q "Commands:"; then
+if output="$("$TOOLBOXER" help 2>&1)" && grep -q "Commands:" <<< "$output"; then
     pass "help command shows usage"
 else
     fail "help command shows usage"
 fi
 
 run_test
-if "$TOOLBOXER" create --help 2>&1 | grep -q -- "--distro"; then
+DIAGNOSE="$(dirname "$TOOLBOXER")/diagnose.sh"
+diagnose_help="$("$DIAGNOSE" --help 2>&1 || true)"
+if bash -n "$DIAGNOSE" && grep -q "shareable log" <<< "$diagnose_help"; then
+    pass "diagnostic collector parses and shows help"
+else
+    fail "diagnostic collector parses and shows help"
+fi
+
+run_test
+if output="$("$TOOLBOXER" create --help 2>&1)" && grep -q -- "--distro" <<< "$output"; then
     pass "create --help shows --distro"
 else
     fail "create --help shows --distro"
 fi
 
 run_test
-if "$TOOLBOXER" enter --help 2>&1 | grep -q -- "--release"; then
+if output="$("$TOOLBOXER" enter --help 2>&1)" && grep -q -- "--release" <<< "$output"; then
     pass "enter --help shows --release"
 else
     fail "enter --help shows --release"
 fi
 
 run_test
-if "$TOOLBOXER" run --help 2>&1 | grep -q -- "--container"; then
+if output="$("$TOOLBOXER" run --help 2>&1)" && grep -q -- "--container" <<< "$output"; then
     pass "run --help shows --container"
 else
     fail "run --help shows --container"
@@ -155,14 +180,104 @@ else
 fi
 
 run_test
-if "$TOOLBOXER" --help 2>&1 | grep -q "config"; then
+if output="$("$TOOLBOXER" --help 2>&1)" && grep -q "config" <<< "$output"; then
     pass "--help lists the config command"
 else
     fail "--help lists the config command"
 fi
 
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Host subuid/subgid preflight (no podman needed) ==="
+
+# Source the helpers (same pattern as the image-resolution tests) so we can
+# assert mapping logic without going through create. Paths are temp files we
+# own; ownership-by-root is covered via the CLI check on empty files below.
+SUBID_SRC="$(mktemp)"
+sed -n \
+    '/^SUBID_MIN_COUNT=/p; /^subid_file_maps_user() {/,/^}/p; /^subid_file_root_owned() {/,/^}/p; /^host_subid_range_ok() {/,/^}/p' \
+    "$TOOLBOXER" > "$SUBID_SRC"
+# shellcheck source=/dev/null
+source "$SUBID_SRC"
+rm -f "$SUBID_SRC"
+
+SUBID_TMP="$(mktemp -d)"
+cleanup_subid() { rm -rf "$SUBID_TMP"; }
+trap 'cleanup; cleanup_subid' EXIT
+
+me="$(id -un)"
+myuid="$(id -u)"
+
 run_test
-if "$TOOLBOXER" provision --help 2>&1 | grep -q "provision script"; then
+: > "$SUBID_TMP/empty"
+if ! subid_file_maps_user "$SUBID_TMP/empty"; then
+    pass "subid mapping rejects an empty file"
+else
+    fail "subid mapping rejects an empty file"
+fi
+
+run_test
+echo "otheruser:100000:65536" > "$SUBID_TMP/other"
+if ! subid_file_maps_user "$SUBID_TMP/other"; then
+    pass "subid mapping rejects a range for a different user"
+else
+    fail "subid mapping rejects a range for a different user"
+fi
+
+run_test
+echo "$me:100000:1" > "$SUBID_TMP/tiny"
+if ! subid_file_maps_user "$SUBID_TMP/tiny"; then
+    pass "subid mapping rejects a too-small range"
+else
+    fail "subid mapping rejects a too-small range"
+fi
+
+run_test
+echo "$me:100000:65536" > "$SUBID_TMP/ok"
+if subid_file_maps_user "$SUBID_TMP/ok"; then
+    pass "subid mapping accepts a 65536-UID range by name"
+else
+    fail "subid mapping accepts a 65536-UID range by name"
+fi
+
+run_test
+echo "$myuid:100000:65536" > "$SUBID_TMP/byuid"
+if subid_file_maps_user "$SUBID_TMP/byuid"; then
+    pass "subid mapping accepts a range keyed by numeric uid"
+else
+    fail "subid mapping accepts a range keyed by numeric uid"
+fi
+
+run_test
+# create must warn (and still proceed) when the host range is unusable. Empty
+# user-owned files reproduce the Fedora case (uid-owned /etc/subuid). Clean up
+# in case Podman is present and create continues past the warning.
+: > "$SUBID_TMP/subuid"
+: > "$SUBID_TMP/subgid"
+output="$(SUBUID_FILE="$SUBID_TMP/subuid" SUBGID_FILE="$SUBID_TMP/subgid" \
+    TOOLBOXER_CONFIG=/nonexistent "$TOOLBOXER" create -m "$SUBID_TMP/mount" subid-preflight-test 2>&1 || true)"
+"$TOOLBOXER" rm -f subid-preflight-test >/dev/null 2>&1 || true
+if grep -q "no usable subuid/subgid range" <<<"$output" \
+    && grep -q "usermod --add-subuids" <<<"$output" \
+    && grep -qi "warning" <<<"$output"; then
+    pass "create warns with a host-side subuid fix when the range is missing"
+else
+    fail "create warns with a host-side subuid fix when the range is missing"
+fi
+
+run_test
+# Validation that does not need a container still runs first: an unknown
+# --distro must not be masked by the subuid check.
+output="$(SUBUID_FILE="$SUBID_TMP/subuid" SUBGID_FILE="$SUBID_TMP/subgid" \
+    "$TOOLBOXER" create -d bubuntu 2>&1 || true)"
+if grep -q "unknown distro 'bubuntu'" <<<"$output"; then
+    pass "unknown --distro is still rejected before the subuid check"
+else
+    fail "unknown --distro is still rejected before the subuid check"
+fi
+
+run_test
+if output="$("$TOOLBOXER" provision --help 2>&1)" && grep -q "provision script" <<< "$output"; then
     pass "provision --help shows usage"
 else
     fail "provision --help shows usage"
@@ -188,12 +303,195 @@ fi
 
 # ---------------------------------------------------------------------------
 echo ""
+echo "=== File mounts (no podman needed) ==="
+
+ENSURE_SRC="$(mktemp)"
+sed -n '/^ensure_mount_source() {/,/^}/p' "$TOOLBOXER" > "$ENSURE_SRC"
+# shellcheck source=/dev/null
+source "$ENSURE_SRC"
+rm -f "$ENSURE_SRC"
+
+MOUNT_TMP="$(mktemp -d)"
+cleanup_mounttmp() { rm -rf "$MOUNT_TMP"; }
+trap 'cleanup; cleanup_subid; cleanup_mounttmp' EXIT
+
+run_test
+mkdir -p "$MOUNT_TMP/missing/parent"
+ensure_mount_source "$MOUNT_TMP/missing/parent/newdir"
+if [[ -d "$MOUNT_TMP/missing/parent/newdir" ]]; then
+    pass "ensure_mount_source creates a missing directory"
+else
+    fail "ensure_mount_source creates a missing directory"
+fi
+
+run_test
+echo contents > "$MOUNT_TMP/gitconfig"
+if ensure_mount_source "$MOUNT_TMP/gitconfig" \
+    && [[ -f "$MOUNT_TMP/gitconfig" ]] \
+    && [[ "$(cat "$MOUNT_TMP/gitconfig")" == contents ]]; then
+    pass "ensure_mount_source leaves an existing file intact"
+else
+    fail "ensure_mount_source leaves an existing file intact"
+fi
+
+run_test
+mkdir -p "$MOUNT_TMP/already"
+if ensure_mount_source "$MOUNT_TMP/already" && [[ -d "$MOUNT_TMP/already" ]]; then
+    pass "ensure_mount_source accepts an existing directory"
+else
+    fail "ensure_mount_source accepts an existing directory"
+fi
+
+
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== AI agent paths (no podman needed) ==="
+
+AGENT_SRC="$(mktemp)"
+sed -n '/^ensure_ai_agent_source() {/,/^}/p; /^AI_AGENT_PATHS=(/,/^)$/p; /^build_ai_agent_args() {/,/^}/p; /^agent_selected() {/,/^}/p; /^agent_source() {/,/^}/p; /^validate_agent_source() {/,/^}/p; /^mount_covers() {/,/^}/p' "$TOOLBOXER" > "$AGENT_SRC"
+# shellcheck source=/dev/null
+source "$AGENT_SRC"
+# Used by the sourced mount_covers helper.
+# shellcheck disable=SC2034
+MOUNT_SPECS=()
+rm -f "$AGENT_SRC"
+
+AGENT_TMP="$(mktemp -d)"
+cleanup_agenttmp() { rm -rf "$AGENT_TMP"; }
+trap 'cleanup; cleanup_subid; cleanup_mounttmp; cleanup_agenttmp' EXIT
+
+run_test
+ensure_ai_agent_source "$AGENT_TMP/.codex" ".codex"
+if [[ -d "$AGENT_TMP/.codex" ]]; then
+    pass "ensure_ai_agent_source creates a missing directory (.codex)"
+else
+    fail "ensure_ai_agent_source creates a missing directory (.codex)"
+fi
+
+run_test
+ensure_ai_agent_source "$AGENT_TMP/.config/cursor" ".config/cursor"
+if [[ -d "$AGENT_TMP/.config/cursor" ]]; then
+    pass "ensure_ai_agent_source creates nested missing directories"
+else
+    fail "ensure_ai_agent_source creates nested missing directories"
+fi
+
+run_test
+ensure_ai_agent_source "$AGENT_TMP/.claude.json" ".claude.json"
+if [[ ! -e "$AGENT_TMP/.claude.json" ]]; then
+    pass "ensure_ai_agent_source does not create a missing file as a directory"
+else
+    fail "ensure_ai_agent_source does not create a missing file as a directory"
+fi
+
+run_test
+ensure_ai_agent_source "$AGENT_TMP/.aider.conf.yml" ".aider.conf.yml"
+if [[ ! -e "$AGENT_TMP/.aider.conf.yml" ]]; then
+    pass "ensure_ai_agent_source skips missing .yml agent files"
+else
+    fail "ensure_ai_agent_source skips missing .yml agent files"
+fi
+
+run_test
+ensure_ai_agent_source "$AGENT_TMP/.config/io.datasette.llm" ".config/io.datasette.llm"
+if [[ -d "$AGENT_TMP/.config/io.datasette.llm" ]]; then
+    pass "ensure_ai_agent_source creates dotted directory names"
+else
+    fail "ensure_ai_agent_source creates dotted directory names"
+fi
+
+run_test
+mkdir -p "$AGENT_TMP/.existing-codex"
+echo keep > "$AGENT_TMP/.existing-codex/auth.json"
+ensure_ai_agent_source "$AGENT_TMP/.existing-codex" ".codex"
+if [[ -d "$AGENT_TMP/.existing-codex" ]] \
+    && [[ "$(cat "$AGENT_TMP/.existing-codex/auth.json")" == keep ]]; then
+    pass "ensure_ai_agent_source leaves an existing directory intact"
+else
+    fail "ensure_ai_agent_source leaves an existing directory intact"
+fi
+
+run_test
+echo '{"ok":true}' > "$AGENT_TMP/.claude.json"
+ensure_ai_agent_source "$AGENT_TMP/.claude.json" ".claude.json"
+if [[ -f "$AGENT_TMP/.claude.json" ]] \
+    && [[ "$(cat "$AGENT_TMP/.claude.json")" == '{"ok":true}' ]]; then
+    pass "ensure_ai_agent_source leaves an existing file intact"
+else
+    fail "ensure_ai_agent_source leaves an existing file intact"
+fi
+
+run_test
+# --ai-agents must mkdir missing dirs then emit a volume for them, and must
+# not mkdir (or mount) missing files such as .claude.json.
+fresh="$(mktemp -d)"
+# The sourced builder calls this fixture override.
+# shellcheck disable=SC2329
+output="$(agent_source() { printf '%s/%s\n' "$fresh" "$1"; }; build_ai_agent_args)" || true
+if [[ -d "$fresh/.codex" ]] \
+    && grep -Fq -- "--volume" <<<"$output" \
+    && grep -Fq -- "$fresh/.codex:$HOME/.codex" <<<"$output" \
+    && [[ ! -e "$fresh/.claude.json" ]] \
+    && ! grep -Fq -- "claude.json" <<<"$output"; then
+    pass "build_ai_agent_args creates and mounts missing agent directories"
+else
+    fail "build_ai_agent_args creates and mounts missing agent directories"
+fi
+rm -rf "$fresh"
+
+run_test
+# Home repair must cover old root-owned content such as ~/.cache while pruning
+# paths backed by host mounts. Mock chown so this remains an unprivileged unit
+# test and inspect exactly which paths the recursive walk selected.
+REPAIR_HOME_SRC="$AGENT_TMP/repair-home-tree.sh"
+sed -n '/^repair_home_tree() {/,/^}/p' "$TOOLBOXER" > "$REPAIR_HOME_SRC"
+repair_root="$AGENT_TMP/repair-home"
+mkdir -p \
+    "$repair_root/.cache/downloads" \
+    "$repair_root/.local/bin" \
+    "$repair_root/.local/share/goose" \
+    "$repair_root/.ssh/agent"
+touch \
+    "$repair_root/.cache/downloads/archive" \
+    "$repair_root/.local/share/goose/session" \
+    "$repair_root/.ssh/agent/socket"
+output="$({
+    # shellcheck source=/dev/null
+    source "$REPAIR_HOME_SRC"
+    # Invoked by the sourced repair_home_tree helper.
+    # shellcheck disable=SC2329
+    chown() {
+        local last=""
+        for last in "$@"; do :; done
+        printf '<%s>\n' "$last"
+    }
+    repair_home_tree 123 456 "$repair_root" \
+        "$repair_root/.ssh" \
+        "$repair_root/.local/share/goose" \
+        ""
+} 2>&1)"
+if grep -Fq "<$repair_root>" <<<"$output" \
+    && grep -Fq "<$repair_root/.cache>" <<<"$output" \
+    && grep -Fq "<$repair_root/.cache/downloads/archive>" <<<"$output" \
+    && grep -Fq "<$repair_root/.local>" <<<"$output" \
+    && grep -Fq "<$repair_root/.local/share>" <<<"$output" \
+    && ! grep -Fq "<$repair_root/.ssh>" <<<"$output" \
+    && ! grep -Fq "<$repair_root/.ssh/agent/socket>" <<<"$output" \
+    && ! grep -Fq "<$repair_root/.local/share/goose>" <<<"$output" \
+    && ! grep -Fq "<$repair_root/.local/share/goose/session>" <<<"$output"; then
+    pass "home repair recurses locally and prunes host mounts"
+else
+    fail "home repair recurses locally and prunes host mounts" "$output"
+fi
+
+# ---------------------------------------------------------------------------
+echo ""
 echo "=== Config file tests (no podman needed) ==="
 
 CONFIG_TMP="$(mktemp -d)"
 cleanup_config() { rm -rf "$CONFIG_TMP"; }
 # Chain config cleanup onto the existing container-cleanup EXIT trap.
-trap 'cleanup; cleanup_config' EXIT
+trap 'cleanup; cleanup_config; cleanup_subid; cleanup_mounttmp; cleanup_agenttmp' EXIT
 
 # Capture combined output before grepping: `... | grep -q` can SIGPIPE the
 # toolboxer process when the match is on an early line, which trips pipefail.
@@ -416,17 +714,17 @@ else
     fail "MOUNT_DIRS env is comma-separated with src:dest support"
 fi
 
-# An invalid spec (empty source) warns and is skipped, not mounted.
+# An invalid explicit spec must fail instead of silently reducing the mount set.
 cat > "$CONFIG_TMP/badmount" <<EOF
 mount = :/dst
 mount = /tmp/keep
 EOF
 run_test
 output="$(TOOLBOXER_CONFIG="$CONFIG_TMP/badmount" "$TOOLBOXER" config 2>&1 || true)"
-if grep -q "invalid mount" <<<"$output" && grep -qF "/tmp/keep" <<<"$output"; then
-    pass "config warns on an invalid mount spec and skips it"
+if grep -q "invalid mount" <<<"$output" && ! grep -q "Effective settings" <<<"$output"; then
+    pass "config rejects an invalid explicit mount"
 else
-    fail "config warns on an invalid mount spec and skips it"
+    fail "config rejects an invalid explicit mount"
 fi
 
 # The "key value" form (no '=') is accepted too.
@@ -488,7 +786,7 @@ echo "=== Image/name resolution (no podman needed) ==="
 # linter doesn't read them as unused here.
 export HOST_ID="fedora" HOST_VERSION_ID="44" HOST_ID_LIKE=""
 RESOLVE_SRC="$(mktemp)"
-sed -n '/^canonical_distro() {/,/^}/p; /^default_release() {/,/^}/p; /^resolve_image() {/,/^}/p; /^resolve_image_from_like() {/,/^}/p; /^resolve_name() {/,/^}/p' "$TOOLBOXER" > "$RESOLVE_SRC"
+sed -n '/^is_rolling_distro() {/,/^}/p; /^canonical_distro() {/,/^}/p; /^default_release() {/,/^}/p; /^resolve_image() {/,/^}/p; /^resolve_image_from_like() {/,/^}/p; /^resolve_name() {/,/^}/p' "$TOOLBOXER" > "$RESOLVE_SRC"
 # shellcheck source=/dev/null
 source "$RESOLVE_SRC"
 rm -f "$RESOLVE_SRC"
@@ -508,6 +806,10 @@ assert_resolve() {  # description  expected  actual
 # quietly built the host distro instead).
 assert_resolve "fedora (host) keeps the host release" \
     "registry.fedoraproject.org/fedora-toolbox:44" "$(resolve_image fedora "")"
+assert_resolve "Rocky host defaults to its major, not an implicit point-release pin" \
+    "docker.io/library/rockylinux:9" "$(HOST_ID=rocky HOST_VERSION_ID=9.5 resolve_image rocky "")"
+assert_resolve "Debian host defaults to its major" \
+    "docker.io/library/debian:12" "$(HOST_ID=debian HOST_VERSION_ID=12.8 resolve_image debian "")"
 assert_resolve "ubuntu default tag is latest, not host 44" \
     "docker.io/library/ubuntu:latest" "$(resolve_image ubuntu "")"
 assert_resolve "opensuse-leap default tag is latest, not host 44" \
@@ -567,7 +869,8 @@ assert_release() {  # description  cver  ccode  request  expect(yes|no)
 }
 assert_release "exact numeric matches (ubuntu:22.04 -> 22.04)" 22.04 jammy 22.04 yes
 assert_release "major request matches floating minor (rocky:9 -> 9.3)" 9.3 "" 9 yes
-assert_release "major.minor request matches same-major image (rocky:8.10 -> 8.9)" 8.9 "" 8.10 yes
+assert_release "point release must match exactly (rocky:8.10 rejects 8.9)" 8.9 "" 8.10 no
+assert_release "Ubuntu releases in the same year are distinct" 24.10 oracular 24.04 no
 assert_release "codename request matches VERSION_CODENAME (ubuntu:jammy)" 22.04 jammy jammy yes
 assert_release "codename request matches debian (bookworm -> 12)" 12 bookworm bookworm yes
 assert_release "wrong major is rejected (ubuntu:22.04 must not accept 24.04)" 24.04 noble 22.04 no
@@ -580,20 +883,30 @@ echo "=== Podman integration tests ==="
 
 if [[ -n "${TOOLBOXER_SKIP_PODMAN:-}" ]]; then
     echo "  SKIP: TOOLBOXER_SKIP_PODMAN set, skipping integration tests"
-elif ! command -v podman &>/dev/null; then
+elif ! type -P podman &>/dev/null; then
     echo "  SKIP: podman not found, skipping integration tests"
 else
+    unset -f podman
+    export XDG_STATE_HOME="$CONFIG_TMP/state"
+    export MOUNT_DIRS="$MOUNT_TMP/project:$HOME/code"
+    reserve_test_name "$TEST_NAME"
     # NOTE: assert on captured output, never `cmd | grep -q`. Under pipefail a
     # left-hand command that exits non-zero (e.g. the duplicate 'create', or a
     # 'not found' lookup) — or a SIGPIPE from grep -q closing the pipe early —
     # makes the pipeline non-zero even when the pattern matched, so the test
     # would spuriously fail. Capturing with `|| true` sidesteps both.
     run_test
-    output="$("$TOOLBOXER" create "$TEST_NAME" 2>&1 || true)"
-    if grep -q "created" <<<"$output"; then
+    # Include a nested home mount: Podman creates ~/.local and ~/.local/share
+    # as root-owned parents unless toolboxer repairs them after startup.
+    nested_home_source="$MOUNT_TMP/nested-home"
+    if output="$("$TOOLBOXER" create \
+        -m "$MOUNT_TMP/project:$HOME/code" \
+        -m "$nested_home_source:$HOME/.local/share/toolboxer-test" \
+        "$TEST_NAME" 2>&1)" && grep -q "created!" <<<"$output"; then
         pass "create container"
     else
         fail "create container"
+        printf '%s\n' "$output" >&2
     fi
 
     run_test
@@ -611,6 +924,15 @@ else
     else
         fail "list shows container"
     fi
+
+    # Reproduce an older container's root-owned cache before toolboxer performs
+    # first-start setup. The repair must work even when the container was
+    # already started outside toolboxer.
+    podman start "$TEST_NAME" >/dev/null 2>&1 || true
+    podman exec --user root "$TEST_NAME" \
+        mkdir -p "$HOME/.cache/root-owned" >/dev/null 2>&1 || true
+    podman exec --user root "$TEST_NAME" \
+        touch "$HOME/.cache/root-owned/archive" >/dev/null 2>&1 || true
 
     run_test
     output="$("$TOOLBOXER" run --container "$TEST_NAME" echo hello 2>&1 || true)"
@@ -682,6 +1004,51 @@ else
     fi
 
     run_test
+    # The AI-agent installers use ~/.local/bin and ~/.local/share. Both must be
+    # writable even when an agent config is mounted below ~/.local/share.
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" sh -c \
+        "mkdir -p '$HOME/.local/bin' && touch '$HOME/.local/share/.toolboxer-write-test' && echo WRITABLE" \
+        2>&1 || true)"
+    if grep -q "WRITABLE" <<<"$output"; then
+        pass "nested mount parents in home are writable"
+    else
+        fail "nested mount parents in home are writable"
+    fi
+
+    run_test
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" sh -c \
+        "touch '$HOME/.cache/root-owned/archive' '$HOME/.cache/claude-installer-test' && echo WRITABLE" \
+        2>&1 || true)"
+    if grep -q "WRITABLE" <<<"$output"; then
+        pass "old root-owned cache content is repaired"
+    else
+        fail "old root-owned cache content is repaired"
+    fi
+
+    # Agent installers place their launchers in ~/.local/bin. Verify both the
+    # direct `run` path and a login shell such as `enter` can resolve them.
+    local_bin_probe="toolboxer-local-bin-test"
+    "$TOOLBOXER" run --container "$TEST_NAME" sh -c \
+        "printf '#!/bin/sh\necho LOCAL_BIN_OK\n' > '$HOME/.local/bin/$local_bin_probe' && chmod +x '$HOME/.local/bin/$local_bin_probe'" \
+        >/dev/null 2>&1 || true
+
+    run_test
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" "$local_bin_probe" 2>&1 || true)"
+    if grep -q "LOCAL_BIN_OK" <<<"$output"; then
+        pass "run resolves commands installed in user-local bin"
+    else
+        fail "run resolves commands installed in user-local bin" "$output"
+    fi
+
+    run_test
+    output="$("$TOOLBOXER" run --container "$TEST_NAME" bash -lc "$local_bin_probe" 2>&1 || true)"
+    if grep -q "LOCAL_BIN_OK" <<<"$output"; then
+        pass "login shell resolves commands installed in user-local bin"
+    else
+        fail "login shell resolves commands installed in user-local bin" "$output"
+    fi
+
+    run_test
     "$TOOLBOXER" stop "$TEST_NAME" >/dev/null 2>&1 || true
     output="$("$TOOLBOXER" rm "$TEST_NAME" 2>&1 || true)"
     if grep -q "removed" <<<"$output"; then
@@ -703,9 +1070,10 @@ else
     cat > "$prov_script" <<'PROV'
 sudo install -d /opt/toolboxer-provisioned
 PROV
-    prov_name="toolboxer-prov-test-$$"
+    prov_name="toolboxer-prov-test-$TEST_SUFFIX"
+    reserve_test_name "$prov_name"
     cleanup_prov() { "$TOOLBOXER" rm -f "$prov_name" >/dev/null 2>&1 || true; }
-    trap 'cleanup; cleanup_config; cleanup_prov' EXIT
+    trap 'cleanup; cleanup_config; cleanup_subid; cleanup_mounttmp; cleanup_agenttmp' EXIT
 
     run_test
     TOOLBOXER_PROVISION="$prov_script" "$TOOLBOXER" create "$prov_name" >/dev/null 2>&1 || true
@@ -730,38 +1098,38 @@ PROV
     cleanup_prov
 
     run_test
-    # A pinned release the registry doesn't publish (rocky ships only major tags,
-    # so rockylinux:8.10 is no such tag) must fail the pull with a clear reason,
-    # never silently fall back to rocky:8. Needs network to attempt the pull.
-    badrel_name="toolboxer-badrel-test-$$"
-    "$TOOLBOXER" rm -f "$badrel_name" >/dev/null 2>&1 || true
-    output="$("$TOOLBOXER" create -d rocky -r 8.10 "$badrel_name" 2>&1 || true)"
-    if grep -qi "could not pull" <<<"$output" && ! "$TOOLBOXER" run --container "$badrel_name" true >/dev/null 2>&1; then
+    # Use an intentionally invalid unique tag, not a point release a registry
+    # might publish later. Never silently substitute another release.
+    badrel_name="toolboxer-badrel-test-$TEST_SUFFIX"
+    reserve_test_name "$badrel_name"
+    status=0
+    output="$("$TOOLBOXER" create -d rocky -r "toolboxer-nonexistent-$$" "$badrel_name" 2>&1)" || status=$?
+    if [[ "$status" != 0 ]] && grep -qi "could not pull" <<< "$output" \
+        && ! "$TOOLBOXER" run --container "$badrel_name" true >/dev/null 2>&1; then
         pass "unpullable pinned release fails with a clear error"
     else
-        fail "unpullable pinned release fails with a clear error"
+        fail "unpullable pinned release fails with a clear error" "$output"
     fi
     "$TOOLBOXER" rm -f "$badrel_name" >/dev/null 2>&1 || true
 
     run_test
-    # When sudo can't be installed (a custom --image whose package manager we
-    # don't handle — here a bash-on-alpine image with only apk), setup must say so
-    # clearly rather than swallow it; and it must NOT emit the misleading sudoers
-    # "did not validate" warning (that's about a malformed file, not missing sudo).
-    # The container is still created — the failure warns, it doesn't abort.
-    nosudo_name="toolboxer-nosudo-test-$$"
-    "$TOOLBOXER" rm -f "$nosudo_name" >/dev/null 2>&1 || true
+    # A minimal image without supported account/package tools must fail setup,
+    # not mark it complete or run the user's command.
+    nosudo_name="toolboxer-nosudo-test-$TEST_SUFFIX"
+    reserve_test_name "$nosudo_name"
     if "$TOOLBOXER" create -i docker.io/bash "$nosudo_name" >/dev/null 2>&1; then
-        # First start runs the user setup, which is where the warning is emitted.
-        output="$("$TOOLBOXER" run --container "$nosudo_name" true 2>&1 || true)"
-        if grep -qi "could not install sudo" <<<"$output" \
-            && ! grep -qi "did not validate" <<<"$output"; then
-            pass "missing sudo is reported clearly at setup"
+        status=0
+        output="$("$TOOLBOXER" run --container "$nosudo_name" echo PAYLOAD_MUST_NOT_RUN 2>&1)" || status=$?
+        if [[ "$status" != 0 ]] \
+            && grep -Eqi "Required image command missing|could not install sudo" <<< "$output" \
+            && ! grep -q PAYLOAD_MUST_NOT_RUN <<< "$output" \
+            && ! podman exec --user root "$nosudo_name" test -f /etc/.toolboxer-setup-v1; then
+            pass "unsupported minimal image fails before payload and setup marker"
         else
-            fail "missing sudo is reported clearly at setup"
+            fail "unsupported minimal image fails before payload and setup marker" "$output"
         fi
     else
-        fail "missing sudo is reported clearly at setup" "create from docker.io/bash failed"
+        fail "unsupported minimal image fails before payload and setup marker" "create from docker.io/bash failed"
     fi
     "$TOOLBOXER" rm -f "$nosudo_name" >/dev/null 2>&1 || true
 
@@ -787,25 +1155,26 @@ PROV
             "$TOOLBOXER" stop "$dname" >/dev/null 2>&1 || true
             "$TOOLBOXER" rm -f "$dname" >/dev/null 2>&1 || true
         }
-        trap 'cleanup; cleanup_config; cleanup_distro' EXIT
+        trap 'cleanup; cleanup_config; cleanup_subid; cleanup_mounttmp; cleanup_agenttmp' EXIT
 
         for dentry in "${test_distros[@]}"; do
             ddistro="${dentry%%:*}"
             drelease=""
             [[ "$dentry" == *:* ]] && drelease="${dentry#*:}"
-            dname="toolboxer-${ddistro//[^a-zA-Z0-9]/_}-test-$$"
+            dname="toolboxer-${ddistro//[^a-zA-Z0-9]/_}-test-$TEST_SUFFIX"
             create_args=(-d "$ddistro")
             [[ -n "$drelease" ]] && create_args+=(-r "$drelease")
 
             echo "--- $dentry ---"
-            "$TOOLBOXER" rm -f "$dname" >/dev/null 2>&1 || true
+            reserve_test_name "$dname"
 
             run_test
-            output="$("$TOOLBOXER" create "${create_args[@]}" "$dname" 2>&1 || true)"
-            if grep -q "created" <<<"$output"; then
+            if output="$("$TOOLBOXER" create "${create_args[@]}" "$dname" 2>&1)" \
+                && grep -q "created!" <<<"$output"; then
                 pass "[$dentry] create"
             else
                 fail "[$dentry] create"
+                printf '%s\n' "$output" >&2
                 cleanup_distro
                 continue
             fi
@@ -828,7 +1197,9 @@ PROV
             if [[ "$osid" == "$expect_id" ]]; then
                 pass "[$dentry] runs $expect_id (ID=$osid)"
             else
-                fail "[$dentry] runs $expect_id (got ID=${osid:-?})"
+                # Surface the run output so a setup failure is diagnosable in CI
+                # instead of only showing an empty ID.
+                fail "[$dentry] runs $expect_id (got ID=${osid:-?})" "run output: ${output:-<empty>}"
             fi
 
             # When a release was pinned, confirm the image really is that version
