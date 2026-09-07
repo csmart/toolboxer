@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keep the GitHub Actions used by CI current, so pinned action versions get
+  # security and compatibility updates instead of silently ageing.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
