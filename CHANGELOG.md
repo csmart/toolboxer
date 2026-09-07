@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-07
+
 ### Added
 
 - Selective agent sharing with `--agent NAME` and config `agents`; XDG and
@@ -15,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   and full-script linting. Safe unit tests cannot call the host's Podman.
 - Bounded `diagnose.sh` logs with private new output files, no config disclosure,
   and explicitly opt-in write probes and agent-version execution.
+- `--pull missing|always|newer|never` policy for `create`, with shell completion,
+  controlling when the image is pulled or refreshed.
+- Warnings that surface previously silent behaviour: before the isolated-mode
+  SELinux `:z` host relabel of shared directories, before the Arch `pacman -Syu`
+  full system upgrade when installing sudo, and when an unsafe `SSH_AUTH_SOCK`
+  path is skipped instead of forwarded.
 
 ### Fixed
 
@@ -56,6 +64,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   unselected parent images.
 - Exact point-release test matching, safe subordinate-ID advice, completion lint,
   and quoted install paths with PREFIX/DESTDIR support.
+- A `#` inside a quoted config value is kept literally instead of being truncated
+  as a comment; an empty `agents =` shares no agents rather than all of them.
 
 ### Changed
 
@@ -68,6 +78,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   not universal drop-in compatibility or unconditional sandbox/SELinux guarantees.
   Existing containers need recreation to change creation-time mounts/security.
   Initialized legacy containers are revalidated without automatic reprovisioning.
+- Warm `enter`/`run` makes fewer Podman calls: run state and the tmpfs list are
+  read in one inspect, and the private runtime directory is re-owned only when it
+  is not already the user's with mode 0700.
 
 ## [0.5.0] - 2026-06-26
 
@@ -225,7 +238,8 @@ is opt-in rather than the default.
   mounts are comma-separated — colon is reserved for `source:dest`. The first
   mount's target is the working directory on `enter`
 
-[Unreleased]: https://github.com/csmart/toolboxer/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/csmart/toolboxer/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/csmart/toolboxer/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/csmart/toolboxer/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/csmart/toolboxer/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/csmart/toolboxer/compare/v0.2.0...v0.3.0
