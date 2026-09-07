@@ -12,3 +12,10 @@ Thumbs.db
 
 # Testing
 tests/tmp/
+__pycache__/
+
+# Local support bundles
+/toolboxer-diagnostics*.log
+
+# Local AI-agent state
+/.claude/settings.local.json

@@ -12,7 +12,7 @@ mkdir -p "$BINDIR"
 mkdir -p "$COMPDIR"
 
 install -m 755 "$SCRIPT_DIR/toolboxer" "$BINDIR/toolboxer"
-install -m 644 "$SCRIPT_DIR/completions/toolboxer.bash" "$COMPDIR/toolboxer"
+install -m 644 "$SCRIPT_DIR/completions/toolboxer.sh" "$COMPDIR/toolboxer"
 
 echo "Installed toolboxer to $BINDIR/toolboxer"
 echo "Installed completions to $COMPDIR/toolboxer"

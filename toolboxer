@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# toolboxer — drop-in replacement for `toolbox` that only mounts selected directories (restricted)
+# toolboxer — rootless development containers with selected bind mounts
 
 set -euo pipefail
 
@@ -61,13 +61,17 @@ is_known_distro() {
 }
 
 # A sensible default release when the user didn't pin one with -r/--release.
-# The host's VERSION_ID only makes sense for the host's own distro — there is no
-# "Ubuntu 44" — so any *other* distro falls back to its current tag. The RHEL
-# family shares a major-version scheme, so those default to a recent major.
+# Only inherit VERSION_ID for the host's distro. Default RHEL-family and Debian
+# images track a major release; explicit -r still requests its exact tag.
 default_release() {
     local distro="${1:-$HOST_ID}"
-    if [[ "$distro" == "$HOST_ID" ]]; then
-        echo "$HOST_VERSION_ID"
+    if is_rolling_distro "$distro"; then
+        echo latest
+    elif [[ "$distro" == "$HOST_ID" ]]; then
+        case "$distro" in
+            rhel|centos|rocky|debian) echo "${HOST_VERSION_ID%%.*}" ;;
+            *) echo "$HOST_VERSION_ID" ;;
+        esac
     else
         case "$distro" in
             rhel|centos|rocky) echo "9" ;;
@@ -79,9 +83,8 @@ default_release() {
 # Resolve the container image from distro + release.
 #
 # Known distros map to their official toolbox/base image at the given release
-# (defaulting via default_release). The release is used verbatim in the tag, so a
-# point release the registry doesn't publish (e.g. rocky:8.10 — Rocky ships only
-# major tags) fails to pull rather than being silently rounded down to the major.
+# (defaulting via default_release). Explicit point releases are not silently
+# rounded down when a registry does not publish the requested tag.
 # A distro we don't recognise directly is mapped to a base via its os-release
 # ID_LIKE (resolve_image_from_like): derivatives such as Mint/Pop!_OS/Manjaro go
 # to their parent, and any RHEL-family clone (Rocky, AlmaLinux, Oracle, …)
@@ -162,7 +165,9 @@ env_image="${IMAGE:-}"
 
 # Values read from the config file (empty/false until load_config runs).
 config_mounts=()
+config_mounts_set=false
 config_ai_agents=""
+config_agents=""
 config_assumeyes=""
 config_privileged=""
 config_isolated=""
@@ -171,6 +176,7 @@ config_distro=""
 config_release=""
 config_container_name=""
 config_authfile=""
+config_pull=""
 config_provision_script=""
 
 CONFIG_FILE="${TOOLBOXER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/toolboxer/config}"
@@ -197,35 +203,69 @@ parse_bool() {
     esac
 }
 
+# Resolve a config value. A value wrapped in matching quotes ("..." or '...')
+# is literal, so it may contain '#'; only whitespace or a comment may follow the
+# closing quote, and a partial or unterminated quote is rejected (return 1) so a
+# spelling like "/a"/b can never be silently truncated into a broader mount. An
+# unquoted value ends at the first '#', preserving the documented
+# comment-anywhere behaviour so a compact trailing comment never silently
+# rewrites a boolean or a path.
+parse_config_value() {
+    local v="$1" q content suffix
+    v="${v#"${v%%[![:space:]]*}"}"                    # trim leading space
+    if [[ "$v" == '"'* || "$v" == \'* ]]; then
+        q="${v:0:1}"; v="${v#?}"                      # note and drop the opening quote
+        [[ "$v" == *"$q"* ]] || return 1              # unterminated quote
+        content="${v%%"$q"*}"                         # up to the closing quote
+        suffix="${v#*"$q"}"                           # whatever follows it
+        suffix="${suffix#"${suffix%%[![:space:]]*}"}" # trim the suffix's leading space
+        [[ -z "$suffix" || "$suffix" == '#'* ]] || return 1
+        printf '%s' "$content"
+    else
+        v="${v%%#*}"                                  # unquoted: '#' starts a comment
+        v="${v%"${v##*[![:space:]]}"}"                # trim trailing space
+        printf '%s' "$v"
+    fi
+}
+
 # Read CONFIG_FILE (if present) into the config_* variables. Format: one
 # "key = value" per line; '#' starts a comment; blank lines are ignored;
-# "key value" (no '=') is also accepted. The 'mount' key may be repeated and/or
-# comma-separated. Unknown keys and bad booleans warn but don't abort.
+# "key value" (no '=') is also accepted. Quote a value ("..." or '...') to keep
+# a literal '#'. The 'mount' key may be repeated and/or comma-separated. Unknown
+# keys and bad booleans warn but don't abort.
 load_config() {
     [[ -f "$CONFIG_FILE" ]] || return 0
 
     local lineno=0 line key value oldifs m
-    local -a parts
+    local -a parts agent_names
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
-        line="${line%%#*}"                            # strip comments
         line="${line#"${line%%[![:space:]]*}"}"       # trim leading space
         line="${line%"${line##*[![:space:]]}"}"       # trim trailing space
-        [[ -z "$line" ]] && continue
+        [[ -z "$line" || "$line" == '#'* ]] && continue
 
-        if [[ "$line" == *=* ]]; then
-            key="${line%%=*}"
-            value="${line#*=}"
-        else                                          # allow "key value"
-            key="${line%%[[:space:]]*}"
-            value="${line#"$key"}"
+        # The key is always a bareword, so split it off with a pattern ("key ="
+        # or "key value") and parse the value separately. Splitting on a raw '='
+        # would let an '=' inside a comment act as the delimiter and silently
+        # drop a setting such as isolated.
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_-]*)[[:space:]]*=?[[:space:]]*(.*)$ ]]; then
+            echo "Warning: ignoring malformed config line $lineno in $CONFIG_FILE" >&2
+            continue
         fi
-        key="${key#"${key%%[![:space:]]*}"}";        key="${key%"${key##*[![:space:]]}"}"
-        value="${value#"${value%%[![:space:]]*}"}";  value="${value%"${value##*[![:space:]]}"}"
+        key="${BASH_REMATCH[1]}"
+        # A malformed quote is a hard error, not a skip: dropping the line would
+        # fall back to the broader DEFAULT_MOUNT_DIRS (for a sole mount) or
+        # silently shrink the requested mount set, both of which can widen host
+        # exposure. Unknown keys and bad booleans keep their lenient handling.
+        if ! value="$(parse_config_value "${BASH_REMATCH[2]}")"; then
+            echo "Error: invalid quoted value on line $lineno in $CONFIG_FILE." >&2
+            return 1
+        fi
         key="${key//-/_}"; key="${key,,}"
 
         case "$key" in
             mount|mount_dirs)
+                config_mounts_set=true
                 # Comma separates several mounts; ':' is reserved for src:dest
                 # (see add_mount_spec). The key may also just be repeated.
                 oldifs="$IFS"; IFS=","; read -ra parts <<< "$value"; IFS="$oldifs"
@@ -235,6 +275,20 @@ load_config() {
                 done
                 ;;
             ai_agents)                config_ai_agents="$(parse_bool "$value")" ;;
+            agents)
+                # Decide sharing from the actual agent names, after splitting on
+                # commas and whitespace. An empty selection (blank, a lone comma,
+                # only whitespace) must share none AND clear any earlier sharing
+                # state, rather than fall through to "all" via agent_selected's
+                # default. A later ai_agents=true or CLI --agent can still opt in.
+                read -ra agent_names <<< "${value//,/ }"
+                if [[ ${#agent_names[@]} -eq 0 ]]; then
+                    echo "Warning: empty 'agents' in $CONFIG_FILE (line $lineno); sharing none (use 'ai_agents = true' for all)" >&2
+                    config_agents=""; config_ai_agents=false
+                else
+                    config_agents="${agent_names[*]}"; config_ai_agents=true
+                fi
+                ;;
             assumeyes|assume_yes)     config_assumeyes="$(parse_bool "$value")" ;;
             privileged)               config_privileged="$(parse_bool "$value")" ;;
             isolated)                 config_isolated="$(parse_bool "$value")" ;;
@@ -243,11 +297,13 @@ load_config() {
             release)                  config_release="$value" ;;
             container_name|container) config_container_name="$value" ;;
             authfile)                 config_authfile="$(expand_tilde "$value")" ;;
+            pull)                     config_pull="$value" ;;
             provision_script|provision) config_provision_script="$(expand_tilde "$value")" ;;
             "")                       : ;;
             *) echo "Warning: unknown config key '$key' in $CONFIG_FILE (line $lineno)" >&2 ;;
         esac
     done < "$CONFIG_FILE"
+    return 0
 }
 
 load_config
@@ -259,7 +315,9 @@ CONTAINER_NAME="${env_container_name:-$config_container_name}"
 IMAGE="${env_image:-$config_image}"
 DISTRO="$config_distro"
 RELEASE="$config_release"
+if [[ -n "$env_image" ]]; then DISTRO=""; RELEASE=""; fi
 AUTHFILE="$config_authfile"
+PULL="${config_pull:-missing}"
 PRESERVE_FDS=""
 
 # Optional provision script, run once inside a new container on first start (and
@@ -279,18 +337,28 @@ MOUNT_SPECS=()
 # Append a mount spec to MOUNT_SPECS: "src" (same path) or "src:dest" (custom
 # target), like podman -v. Leading ~ expanded on each side; stored as "src:dest".
 add_mount_spec() {
-    local spec="$1" src dest
+    local spec="$1" src dest existing
     if [[ "$spec" == *:* ]]; then
         src="$(expand_tilde "${spec%%:*}")"
         dest="$(expand_tilde "${spec#*:}")"
     else
         src="$(expand_tilde "$spec")"
-        dest="$src"
+        dest=""
     fi
-    if [[ -z "$src" || -z "$dest" ]]; then
-        echo "Warning: ignoring invalid mount '$spec' (expected src or src:dest)" >&2
-        return
+    if [[ -z "$src" || "$src" == *$'\n'* || "$src" == *$'\t'* \
+        || ( "$spec" == *:* && ( -z "$dest" || "$dest" != /* || "$dest" == *:* ) ) \
+        || "$dest" == *$'\n'* || "$dest" == *$'\t'* ]]; then
+        echo "Error: invalid mount '$spec' (expected a path or SRC:/absolute/destination)." >&2
+        return 1
     fi
+    src="$(realpath -m -- "$src")" || return
+    dest="$(realpath -ms -- "${dest:-$src}")" || return
+    [[ "$dest" != / ]] || { echo 'Error: mounting over / is not supported.' >&2; return 1; }
+    for existing in "${MOUNT_SPECS[@]}"; do
+        [[ "${existing#*:}" != "$dest" ]] || {
+            echo "Error: duplicate mount destination '$dest'." >&2; return 1;
+        }
+    done
     MOUNT_SPECS+=("$src:$dest")
 }
 
@@ -302,8 +370,9 @@ add_mount_list() {
     IFS=","; read -ra items <<< "$1"; IFS="$oldifs"
     for item in "${items[@]}"; do
         item="${item#"${item%%[![:space:]]*}"}"; item="${item%"${item##*[![:space:]]}"}"
-        [[ -n "$item" ]] && add_mount_spec "$item"
+        if [[ -n "$item" ]]; then add_mount_spec "$item" || return; fi
     done
+    return 0
 }
 
 # Resolve the mounts by precedence: CLI -m/--mount > $MOUNT_DIRS env >
@@ -314,16 +383,15 @@ resolve_mount_dirs() {
     local d
     MOUNT_SPECS=()
     if [[ ${#cli_mounts[@]} -gt 0 ]]; then
-        for d in "${cli_mounts[@]}"; do add_mount_spec "$d"; done
+        for d in "${cli_mounts[@]}"; do add_mount_spec "$d" || return; done
     elif [[ -n "$env_mount_dirs" ]]; then
-        add_mount_list "$env_mount_dirs"
-    elif [[ ${#config_mounts[@]} -gt 0 ]]; then
-        for d in "${config_mounts[@]}"; do add_mount_spec "$d"; done
-    fi
-    # Fall back to the default if nothing valid was given.
-    if [[ ${#MOUNT_SPECS[@]} -eq 0 ]]; then
+        add_mount_list "$env_mount_dirs" || return
+    elif [[ "$config_mounts_set" == true ]]; then
+        for d in "${config_mounts[@]}"; do add_mount_spec "$d" || return; done
+    else
         add_mount_spec "$DEFAULT_MOUNT_DIRS"
     fi
+    [[ ${#MOUNT_SPECS[@]} -gt 0 ]] || { echo 'Error: no mounts specified.' >&2; return 1; }
 }
 
 # Split a canonical "src:dest" spec into _MOUNT_SRC / _MOUNT_DEST on the first
@@ -350,13 +418,25 @@ format_mount() {
 resolve_modes() {
     if [[ -n "$cli_ai_agents" ]]; then copy_ai_agents="$cli_ai_agents"
     else copy_ai_agents="${config_ai_agents:-false}"; fi
+    AGENT_SELECTION="${cli_agents[*]:-${config_agents:-all}}"
+    local agent
+    local -a selected_agents
+    read -ra selected_agents <<< "$AGENT_SELECTION"
+    for agent in "${selected_agents[@]}"; do
+        case "$agent" in
+            all|claude|codex|gemini|qwen|cursor|grok|continue|copilot|goose|opencode|crush|aider|llm|sgpt|interpreter) ;;
+            *) echo "Error: unknown agent '$agent'." >&2; return 1 ;;
+        esac
+    done
+    AGENT_SELECTION="$(printf '%s\n' "${selected_agents[@]}" | LC_ALL=C sort -u | paste -sd ' ')" || return
+    [[ " $AGENT_SELECTION " != *' all '* ]] || AGENT_SELECTION=all
 
     if [[ -n "$cli_assumeyes" ]]; then assume_yes="$cli_assumeyes"
     else assume_yes="${config_assumeyes:-false}"; fi
 
     # Both chosen explicitly on the CLI is contradictory.
     if [[ "$cli_privileged" == true && "$cli_isolated" == true ]]; then
-        echo "Error: --privileged and --isolated are mutually exclusive"
+        echo "Error: --privileged and --isolated are mutually exclusive" >&2
         exit 1
     fi
 
@@ -378,7 +458,7 @@ resolve_modes() {
 
     # Catch a config file that enables both.
     if [[ "$privileged" == true && "$isolated" == true ]]; then
-        echo "Error: privileged and isolated are mutually exclusive (check $CONFIG_FILE)"
+        echo "Error: privileged and isolated are mutually exclusive (check $CONFIG_FILE)" >&2
         exit 1
     fi
 }
@@ -387,331 +467,291 @@ resolve_modes() {
 # Usage
 # ---------------------------------------------------------------------------
 
+# Help that was asked for is output; help printed because of a usage error is
+# a diagnostic. 'run' and 'config' callers capture stdout for real results, so
+# error-path usage text must not land there.
+emit_usage() {
+    local status="${1:-1}"
+    if [[ "$status" -eq 0 ]]; then cat; else cat >&2; fi
+    exit "$status"
+}
+
 usage() {
-    cat <<EOF
-toolboxer — a restricted, drop-in replacement for toolbox.
+    emit_usage "${1:-1}" <<EOF
+toolboxer — rootless development containers with selected mounts.
 
-Usage: $prog [global options] <command> [command options] [args...]
+Usage: $prog [global options] COMMAND [command options] [args...]
 
-Creates Podman development containers that mount only the directories you
-choose, instead of your entire home directory:
-  * Only selected directories are mounted (read-write)
-  * Host integration (X11, Wayland, D-Bus, SSH agent, DNS, etc.) is seamless
-  * A matching user with passwordless sudo is created inside the container
-  * Uses --userns=keep-id so your UID/GID stay the same inside
-
-Running '$prog' with no command defaults to 'enter'.
+With no command, defaults to 'enter'. Integrated mode shares host services and
+namespaces: it is for trusted development tools, not a security sandbox.
 
 Commands:
-  create [CONTAINER]      Create the container
-  enter  [CONTAINER]      Enter the container (starts it if stopped, offers to create)
-  run <cmd> [args...]     Run a single command inside the container
-  list                    List toolboxer containers and/or images
-  stop   [CONTAINER]      Stop the container
-  rm     [CONTAINER...]   Remove the container(s)
-  rmi    <IMAGE...>       Remove toolboxer image(s)
-  config                  Show the effective configuration (config file + flags)
-  provision [CONTAINER]   Re-run the provision script in a container
-  help                    Show this help
+  create [CONTAINER]      Create a stopped container
+  enter [CONTAINER]       Start and enter; offer creation if missing
+  run COMMAND [ARGS...]   Run a command, preserving its output and exit status
+  list                   List toolboxer containers and tracked images
+  stop [CONTAINER]        Stop a toolboxer container
+  rm [CONTAINER...]       Remove explicitly selected toolboxer containers
+  rmi [IMAGE...]          Remove selected images, protecting unrelated containers
+  config                 Show resolved settings without contacting Podman
+  provision [CONTAINER]  Run the configured provision script again
+  help [COMMAND]         Show general or command-specific help
 
-Global options (must come before the command):
-  -m, --mount SPEC        Mount a directory (read-write) into the container.
-                          SPEC is DIR (mounted at the same path) or SRC:DEST
-                          (mounted at a custom target), like podman -v. Repeat
-                          the flag once per mount. This replaces the default
-                          mount ($DEFAULT_MOUNT_DIRS) rather than adding to it.
-  -A, --ai-agents         Also mount the config of any AI agent CLIs found in
-                          your home (Claude Code, Codex, Gemini, Aider, …) so
-                          they run inside the container with your host login.
-  -y, --assumeyes         Assume yes to prompts (e.g. auto-create on 'enter').
-      --privileged        Run the container privileged (needed to run podman or
-                          docker inside it). Reduces isolation; off by default.
-      --isolated          Hardened sandbox: SELinux-confined, only your mounts,
-                          private namespaces, no host integration — for running
-                          untrusted code. Incompatible with --privileged.
-  -h, --help              Show this help
+Global options (before COMMAND):
+  -m, --mount SPEC        Read-write bind: PATH or SOURCE:/absolute/target.
+                         Repeat to replace the default mount ($DEFAULT_MOUNT_DIRS).
+  -A, --ai-agents         Share all supported agents' config directories
+      --agent NAME       Share one agent; repeat to select several
+  -y, --assumeyes         Accept creation prompts
+      --privileged       Enable privileged host integration; trusted code only
+      --isolated         Private namespaces, no automatic host-service mounts.
+                         Requests SELinux confinement when enabled on the host;
+                         not an offline environment or a VM.
+  -h, --help             Show help
 
-  Each of -A/-y/--privileged/--isolated has a --no-... form (--no-ai-agents,
-  --no-assumeyes, --no-privileged, --no-isolated) to switch it off for one run
-  when it is enabled by default in the config file.
+Boolean options have --no-... forms to override configuration defaults.
+Mount/agent/mode options can also follow 'create'. Creation settings are saved:
+flags on 'enter' or 'run' cannot change an existing container's mounts or mode.
 
-Each command has its own options too — see '$prog <command> --help'.
-
-Mounting additional directories:
-  By default only $DEFAULT_MOUNT_DIRS is mounted. Pass -m/--mount once per
-  directory you want available inside the container (the first one becomes the
-  working directory on 'enter'). Each mount is DIR or SRC:DEST (a custom target
-  path inside the container, like podman -v):
-
-    $prog -m ~/code -m ~/documents create
-    $prog create -m ~/code -m ~/work/project:/project   # custom target path
-
-  Or set MOUNT_DIRS to a comma-separated list (CLI flags override it):
-
-    MOUNT_DIRS=~/code,~/documents:/docs $prog create
-
-Environment variables (override the config file, but not CLI flags):
-  CONTAINER_NAME          Default container name
-  IMAGE                   Image to use (e.g. fedora:41)
-  MOUNT_DIRS              Comma-separated list of mounts (DIR or SRC:DEST each)
-
-Configuration file (lowest priority — env vars and CLI flags override it):
-  Set defaults in a "key = value" file at \$TOOLBOXER_CONFIG, else
-  \${XDG_CONFIG_HOME:-~/.config}/toolboxer/config. Keys (all optional):
-  mount (DIR or SRC:DEST; repeatable or comma-separated), ai_agents, assumeyes,
-  privileged, isolated, image, distro, release, container_name, authfile,
-  provision_script. Booleans take true/false. '#' starts a comment. Example:
-
-    mount = ~/code
-    mount = ~/data:/data
-    ai_agents = true
-    privileged = true
+Defaults: TOOLBOXER_CONFIG, otherwise XDG_CONFIG_HOME/toolboxer/config, otherwise
+~/.config/toolboxer/config. Precedence: CLI > environment > config > defaults.
+Environment overrides: MOUNT_DIRS (comma-separated), IMAGE, CONTAINER_NAME.
+Config keys: mount (repeatable), agents, ai_agents, assumeyes, privileged,
+isolated, image, distro, release, container_name, authfile, provision_script.
+See README.md for supported agents, provisioning, and security limitations.
 
 Examples:
-  $prog                                # enter the default container
-  $prog create                         # create the default container
-  $prog -m ~/code -m ~/docs create     # create, mounting two directories
-  $prog --ai-agents create             # create, sharing your AI agent logins
-  $prog create --distro ubuntu --release 24.04
-  $prog create --image fedora:41 my-project
-  $prog enter my-project               # enter a named container
-  $prog run make test                  # run a command in the container
-  $prog list --containers              # list only containers
-  $prog rm --all --force               # remove every toolboxer container
+  $prog create -d ubuntu -r 24.04 -m ~/code/project:/work dev
+  $prog enter dev
+  $prog run -c dev make test
+  $prog create --isolated --agent codex -m ~/code/project:/work coding
 EOF
-    exit "${1:-1}"
 }
 
 usage_create() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog create [options] [CONTAINER]
 
-Create a new toolboxer container. If CONTAINER is omitted, the name is derived
-from the distro and release (e.g. ${HOST_ID}-toolbox-${HOST_VERSION_ID}).
+Create a stopped container; verified user/sudo setup runs on first use.
+Custom images need Bash, standard account tools, and sudo or a supported package
+manager. The image entrypoint is replaced with 'sleep infinity'.
 
 Options:
-  -d, --distro DISTRO   Base distro: fedora, rhel, centos, rocky, ubuntu, debian,
-                        arch, opensuse-leap, opensuse-tumbleweed (aliases:
-                        opensuse/suse/leap -> opensuse-leap, tumbleweed ->
-                        opensuse-tumbleweed, archlinux -> arch). An unknown distro
-                        is rejected; use --image for anything not listed
-                        (default: host distro, $HOST_ID; incompatible with --image)
-  -r, --release RELEASE Distro release/version, used verbatim as the image tag. For
-                        a distro other than the host's, defaults to that distro's
-                        current tag, not the host release. A release the registry
-                        doesn't publish fails the pull; rolling distros (arch,
-                        opensuse-tumbleweed) take no release
-                        (default: host release, $HOST_VERSION_ID; incompatible with --image)
-  -i, --image NAME      Use a custom image (incompatible with --distro/--release)
-      --authfile FILE   Registry credentials file for pulling the image
-  -m, --mount SPEC      Mount a directory (read-write); SPEC is DIR or SRC:DEST
-                        (custom target, like podman -v). Repeat once per mount.
-                        Replaces the default mount ($DEFAULT_MOUNT_DIRS).
-                        The first mount's target becomes the working directory.
-  -A, --ai-agents       Also mount the config/data dirs of AI agent CLIs found
-                        in your home (Claude Code, Codex, Gemini, Aider, Goose,
-                        OpenCode, …) at the same paths, so they run inside the
-                        container using your existing host login/sessions. Only
-                        dirs that exist are mounted; the agent CLI itself must
-                        be installed in the container.
-      --privileged      Run the container privileged (needed to run podman or
-                        docker inside it). Reduces isolation; off by default.
-      --isolated        Hardened sandbox: SELinux-confined, only your mounts
-                        (relabeled), private namespaces, no host integration
-                        (no GUI, host DNS, or nested podman). For untrusted
-                        code. Incompatible with --privileged.
-  -h, --help            Show this help
+  -d, --distro DISTRO     fedora, rhel, centos, rocky, ubuntu, debian, arch,
+                         opensuse-leap, opensuse-tumbleweed
+  -r, --release RELEASE   Pin a published image tag; no fallback if unavailable.
+                         Rolling distros accept only latest.
+  -i, --image IMAGE       Custom image; incompatible with --distro/--release
+      --authfile FILE     Registry credentials used when pulling
+      --pull POLICY       missing (default), always, newer, or never;
+                         always/newer re-check the source registry.
+  -m, --mount SPEC        PATH or SOURCE:/absolute/target (repeatable)
+  -A, --ai-agents         Share all supported agents' config directories
+      --agent NAME       Select an agent (repeatable)
+      --privileged       Privileged integrated mode
+      --isolated         Private namespaces without host-service integration
+  -h, --help             Show help
 
-  -A/--privileged/--isolated each have a --no-... form (--no-ai-agents,
-  --no-privileged, --no-isolated) to switch off a config-file default.
-
-Examples:
-  $prog create
-  $prog create -m ~/code -m ~/documents
-  $prog create --ai-agents
-  $prog create --distro ubuntu --release 24.04 ubuntu-dev
-  $prog create --image fedora:41
+Mode/agent booleans support --no-... overrides. --privileged and --isolated
+are mutually exclusive. Aliases: opensuse/suse/leap, tumbleweed, archlinux.
+Missing mount sources are created as directories; existing files also work.
+The first directory target is the saved workdir; file-only mounts use /tmp.
+Agent directories are shared read-write; individual agent files are creation-time
+snapshots, not synchronized back to the host. Review README.md before sharing
+credentials or enabling privileged mode.
 EOF
-    exit "${1:-1}"
 }
 
 usage_enter() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog enter [options] [CONTAINER]
 
-Enter a toolboxer container, starting it if stopped. If no container is named,
-the default is used; if exactly one toolboxer container exists, it is chosen
-automatically. If none exist, you are offered the chance to create one.
-
-To mount extra directories when creating on demand, pass -m/--mount as a global
-option before 'enter' (e.g. '$prog -m ~/code enter').
+Start and enter a toolboxer container using a Bash login shell. If missing,
+offer to create it. Without an explicit selection, the sole toolboxer container
+may be selected. Global creation flags go before 'enter'.
 
 Options:
-  -d, --distro DISTRO   Enter the container for a different distro
-                        (fedora, rhel, centos, rocky, ubuntu, debian, arch, opensuse-*)
-  -r, --release RELEASE Enter the container for a different release
-  -h, --help            Show this help
+  -d, --distro DISTRO     Select the distro's container
+  -r, --release RELEASE   Select the release's container
+  -h, --help             Show help
 
-Examples:
-  $prog enter
-  $prog enter my-project
-  $prog enter --distro ubuntu --release 24.04
+Uses the saved workdir, or maps the current host directory through a bind mount.
 EOF
-    exit "${1:-1}"
 }
 
 usage_run() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog run [options] [--] COMMAND [ARGS...]
 
-Run a single command inside a toolboxer container, then exit. The container is
-started first if it is stopped. Use '--' before COMMAND if its arguments would
-otherwise be mistaken for run's own options.
+Start a toolboxer container and execute COMMAND as the matching user.
+Options are parsed only before COMMAND. Output and command exit status are
+preserved; setup messages go to stderr. No login profiles are sourced.
 
 Options:
-  -c, --container NAME  Run in a specific container (default: the resolved container)
-  -d, --distro DISTRO   Run in the container for a different distro
-                        (fedora, rhel, centos, rocky, ubuntu, debian, arch, opensuse-*)
-  -r, --release RELEASE Run in the container for a different release
-      --preserve-fds N  Pass down N extra inherited file descriptors
-  -h, --help            Show this help
+  -c, --container NAME   Select a container
+  -d, --distro DISTRO    Select the distro's container
+  -r, --release RELEASE  Select the release's container
+      --preserve-fds N   Pass N extra inherited file descriptors (runtime-dependent)
+  -h, --help            Show help
 
 Examples:
-  $prog run make test
-  $prog run --container my-project gcc -o hello hello.c
-  $prog run -- ls -la
+  $prog run -c dev make test
+  $prog run -c dev sh -c 'printf "%s\\n" hello'
 EOF
-    exit "${1:-1}"
 }
 
 usage_list() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog list [options]
 
-List toolboxer containers and images. With no options, both are shown.
+List toolboxer containers and images tracked by immutable image ID.
+With no selectors, show both sections. Both selectors can be combined.
 
 Options:
-  -c, --containers      Show only containers
-  -i, --images          Show only images
-  -h, --help            Show this help
-
-Examples:
-  $prog list
-  $prog list --containers
-  $prog list --images
+  -c, --containers      Show containers
+  -i, --images          Show tracked images, including unused base images
+  -h, --help            Show help
 EOF
-    exit "${1:-1}"
 }
 
 usage_rm() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog rm [options] [CONTAINER...]
 
-Remove one or more toolboxer containers. Like toolbox, this needs an explicit
-target: a container name, --all, or --distro/--release (which resolve the name
-for you). A bare 'rm' is an error — unlike enter/run/stop, it never falls back
-to the host default or the only container. Running containers need --force.
+Remove explicit toolboxer targets and their anonymous volumes. Host bind sources
+and named volumes are kept. Bare 'rm' is an error; config/env defaults alone
+never authorize removal. Errors are reported with a nonzero exit status.
 
 Options:
-  -a, --all             Remove all toolboxer containers
-  -f, --force           Force removal of running containers
-  -d, --distro DISTRO   Remove the container for a different distro
-  -r, --release RELEASE Remove the container for a different release
-  -h, --help            Show this help
-
-Examples:
-  $prog rm my-project another-project
-  $prog rm -r 44                  # removes the fedora-toolbox-44 container
-  $prog rm --all --force
+  -a, --all             Remove all toolboxer containers; no other target selectors
+  -f, --force           Allow removal of running containers
+  -d, --distro DISTRO   Resolve a target by distro
+  -r, --release RELEASE Resolve a target by release
+  -h, --help            Show help
 EOF
-    exit "${1:-1}"
 }
 
 usage_rmi() {
-    cat <<EOF
-Usage: $prog rmi [options] <IMAGE...>
+    emit_usage "${1:-1}" <<EOF
+Usage: $prog rmi [options] [IMAGE...]
 
-Remove one or more toolbox images. Specify image name(s) or use --all.
+Remove explicitly named local images, or all tracked toolboxer image IDs.
+Images used by unrelated containers are protected, even with --force.
 
 Options:
-  -a, --all             Remove all toolbox images
-  -f, --force           Force removal (removes dependent containers too)
-  -h, --help            Show this help
-
-Examples:
-  $prog rmi fedora-toolbox:41
-  $prog rmi --all
-  $prog rmi --all --force
+  -a, --all             Select tracked image IDs, not every local Podman image
+  -f, --force           Also remove dependent toolboxer containers and their
+                       anonymous volumes; never remove unrelated containers
+  -h, --help            Show help
 EOF
-    exit "${1:-1}"
 }
 
 usage_stop() {
-    cat <<EOF
+    emit_usage "${1:-1}" <<EOF
 Usage: $prog stop [options] [CONTAINER]
 
-Stop a running toolboxer container. If no container is named, it is resolved
-from --distro/--release (or the host defaults); if none of those match and only
-one toolboxer container exists, that one is stopped.
+Stop a toolboxer container, selecting the default as for 'enter'.
 
 Options:
-  -d, --distro DISTRO   Stop the container for a different distro
-  -r, --release RELEASE Stop the container for a different release
-  -h, --help            Show this help
-
-Examples:
-  $prog stop
-  $prog stop my-project
-  $prog stop -r 44                # stops the fedora-toolbox-44 container
+  -d, --distro DISTRO    Select the distro's container
+  -r, --release RELEASE  Select the release's container
+  -h, --help            Show help
 EOF
-    exit "${1:-1}"
 }
 
 usage_config() {
-    cat <<EOF
-Usage: $prog config
+    emit_usage "${1:-1}" <<EOF
+Usage: $prog [global options] config
 
-Show the effective configuration: the config file location and the settings as
-resolved from defaults, the config file, environment variables, and any global
-flags given before 'config'. Read-only — it changes nothing.
-
-Examples:
-  $prog config
-  $prog --privileged config       # preview with a flag applied
+Show the effective configuration and config file path. Read-only: no Podman
+calls, mount creation, or provisioning. CLI overrides environment and config.
 EOF
-    exit "${1:-1}"
 }
 
 usage_provision() {
-    cat <<EOF
-Usage: $prog provision [CONTAINER]
+    emit_usage "${1:-1}" <<EOF
+Usage: $prog provision [options] [CONTAINER]
 
-Run the provision script inside CONTAINER (resolved like 'enter' from -d/-r or
-the name). New containers are provisioned automatically on first start; use this
-to re-run after editing the script, or to provision an older container.
+Run the provision script as the matching user with passwordless sudo available.
+Uses TOOLBOXER_PROVISION, config provision_script, or provision.sh beside the
+config file. Scripts run under Bash; include 'set -e' to stop on failed commands.
 
-The script is read from \$TOOLBOXER_PROVISION, else 'provision_script' in the
-config file, else a provision.sh next to it. It runs as you (with passwordless
-sudo) and is executed with bash. For anything heavy or that must be fast and
-reproducible, build a custom image and use it with -i/--image instead.
+First use provisions new containers automatically. Explicit provision runs once
+per request, including first use, and returns nonzero on failure. Automatic
+failures warn and are retried on the next use. Concurrent initialization is locked.
 
 Options:
-  -d, --distro DISTRO   Resolve the container by distro
-  -r, --release RELEASE Resolve the container by release
-  -h, --help            Show this help
-
-Examples:
-  $prog provision
-  $prog provision -d ubuntu -r 24.04
+  -d, --distro DISTRO    Select the distro's container
+  -r, --release RELEASE  Select the release's container
+  -h, --help            Show help
 EOF
-    exit "${1:-1}"
 }
 
 # ---------------------------------------------------------------------------
-# Parse global options (only -m/--mount and -h/--help before the command)
+# Parse global options
 # ---------------------------------------------------------------------------
 
 cli_mounts=()
+cli_agents=()
+positional_container_set=false
+cli_release_set=false
+
+set_container_arg() {
+    if [[ "$positional_container_set" == true ]]; then
+        echo 'Error: only one container name may be specified.' >&2
+        exit 2
+    fi
+    CONTAINER_NAME="$1"
+    positional_container_set=true
+}
+
+set_distro() {
+    local selected
+    selected="$(canonical_distro "$1")"
+    if [[ "$selected" != "$(canonical_distro "$DISTRO")" && "$cli_release_set" == false ]]; then RELEASE=""; fi
+    DISTRO="$selected"
+    if [[ "${cli_image_set:-false}" != true ]]; then IMAGE=""; fi
+}
+
+# Normalize option=value and short forms only before run's command payload.
+# Validate values here so individual parsers never dereference a missing $2.
+normalize_cli() {
+    NORMALIZED_ARGS=()
+    local command="" arg option value
+    while [[ $# -gt 0 ]]; do
+        arg="$1"; shift
+        if [[ "$arg" == -- ]]; then
+            NORMALIZED_ARGS+=("--" "$@")
+            break
+        fi
+        case "$arg" in
+            --mount=*|--agent=*|--distro=*|--image=*|--release=*|--container=*|--authfile=*|--pull=*|--preserve-fds=*)
+                option="${arg%%=*}"; value="${arg#*=}"; set -- "$value" "$@"; arg="$option" ;;
+            --*=*) echo "Error: '${arg%%=*}' does not accept =value; use the documented option form." >&2; exit 2 ;;
+            -[mdirc]?*) value="${arg:2}"; arg="${arg:0:2}"; set -- "$value" "$@" ;;
+            -af|-fa) NORMALIZED_ARGS+=(-a -f); continue ;;
+        esac
+        case "$arg" in
+            -m|--mount|--agent|-d|--distro|-i|--image|-r|--release|-c|--container|--authfile|--pull|--preserve-fds)
+                # -i/-c are boolean selectors for list.
+                if [[ "$command" != list ]]; then
+                    if [[ $# -eq 0 || -z "$1" || "$1" == -* ]]; then
+                        echo "Error: $arg requires a value." >&2; exit 2
+                    fi
+                    NORMALIZED_ARGS+=("$arg" "$1"); shift; continue
+                fi ;;
+        esac
+        NORMALIZED_ARGS+=("$arg")
+        if [[ "$arg" != -* ]]; then
+            if [[ -z "$command" ]]; then command="$arg"
+            elif [[ "$command" == run ]]; then NORMALIZED_ARGS+=("$@"); break
+            fi
+        fi
+    done
+}
+
+normalize_cli "$@"
+set -- "${NORMALIZED_ARGS[@]}"
 # Tri-state: "" = not given on the CLI (fall back to the config file), else the
 # explicit choice. resolve_modes turns these into the final booleans below.
 cli_ai_agents=""
@@ -727,6 +767,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         -m|--mount)       cli_mounts+=("$2");   shift 2 ;;
         -A|--ai-agents)   cli_ai_agents=true;   shift ;;
+        --agent)         cli_agents+=("$2"); cli_ai_agents=true; shift 2 ;;
         --no-ai-agents)   cli_ai_agents=false;  shift ;;
         -y|--assumeyes)   cli_assumeyes=true;   shift ;;
         --no-assumeyes)   cli_assumeyes=false;  shift ;;
@@ -735,17 +776,54 @@ while [[ $# -gt 0 ]]; do
         --isolated)       cli_isolated=true;    shift ;;
         --no-isolated)    cli_isolated=false;   shift ;;
         -h|--help)        usage 0 ;;
-        -*)               echo "Unknown option: $1"; usage ;;
+        --)              shift; break ;;
+        -*)               echo "Unknown option: $1" >&2; usage ;;
         *)                break ;;
     esac
 done
 
-resolve_modes
-resolve_mount_dirs
+# create has a second option pass; validate its final settings only afterwards.
+if [[ "${1:-enter}" != create ]]; then
+    resolve_modes
+    resolve_mount_dirs
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Bind-mount sources must exist on the host or podman creates them as
+# directories. Missing paths become directories; an existing file (e.g.
+# ~/.gitconfig) is left alone — mkdir -p would fail with "File exists".
+ensure_mount_source() {
+    local src="$1"
+    [[ ! -L "$src" || -e "$src" ]] || { echo "Error: dangling mount symlink '$src'." >&2; return 1; }
+    [[ -e "$src" ]] || mkdir -p "$src"
+}
+
+# Capture builders synchronously: process substitutions discard their failures.
+collect_args() {
+    local output
+    BUILT_ARGS=()
+    output="$("$@")" || return
+    if [[ -n "$output" ]]; then mapfile -t BUILT_ARGS <<< "$output"; fi
+}
+
+# --ai-agents bind-mounts each candidate. Missing directories are created on
+# the host so a first-time login inside the container (e.g. ~/.codex) is
+# written here, not lost in the overlay. Missing files are skipped: mkdir
+# would turn .claude.json into a directory and block the real file later.
+ensure_ai_agent_source() {
+    local src="$1" rel="$2"
+    [[ -e "$src" ]] && return 0
+    local base="${rel##*/}"
+    # Only skip names that are themselves files. Dotted directory names
+    # (io.datasette.llm) must still be created.
+    case "$base" in
+        *.json|*.yml|*.yaml|*.toml|*.conf) return 0 ;;
+    esac
+    mkdir -p "$src"
+}
 
 build_volume_args() {
     local relabel="${1:-}"   # SELinux relabel suffix ("z"), or empty
@@ -753,13 +831,37 @@ build_volume_args() {
     [[ -n "$relabel" ]] && opt=":$relabel"
     for spec in "${MOUNT_SPECS[@]}"; do
         parse_mount_spec "$spec"
-        mkdir -p "$_MOUNT_SRC"
+        ensure_mount_source "$_MOUNT_SRC" || return
         # By default no SELinux relabel: the container runs with label=disable,
         # so :z would be pointless and fails on any file in the mount owned by
         # another user. --isolated runs confined and passes "z" to relabel.
         args+=(--volume "$_MOUNT_SRC:$_MOUNT_DEST$opt")
     done
     printf '%s\n' "${args[@]}"
+}
+
+# Validate and canonicalise XDG_RUNTIME_DIR once so the tmpfs mount, the saved
+# label, and the exported env value are byte-identical. A non-canonical spelling
+# (trailing slash, .., //) would otherwise be mounted at the resolved path but
+# exported verbatim, and that raw path need not resolve inside the container.
+resolved_runtime_dir() {
+    local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [[ "$dir" != /* || "$dir" == / || "$dir" == *:* \
+        || "$dir" == *$'\n'* || "$dir" == *$'\t'* ]]; then
+        echo 'Error: XDG_RUNTIME_DIR must be an absolute directory path other than /.' >&2
+        return 1
+    fi
+    dir="$(realpath -ms -- "$dir")" || return
+    [[ "$dir" != / ]] || { echo 'Error: XDG_RUNTIME_DIR must not resolve to /.' >&2; return 1; }
+    printf '%s\n' "$dir"
+}
+
+# A path used on both sides of --volume src:dest must not contain the ':'
+# separator, a tab, or a newline, any of which would split or corrupt the
+# volume spec. Host-integration sockets come from env (SSH_AUTH_SOCK,
+# WAYLAND_DISPLAY, DBUS_SESSION_BUS_ADDRESS), so guard them like a user mount.
+volume_safe() {
+    [[ "$1" != *:* && "$1" != *$'\n'* && "$1" != *$'\t'* ]]
 }
 
 build_host_integration_args() {
@@ -787,28 +889,35 @@ build_host_integration_args() {
         args+=(--volume "/tmp/.X11-unix:/tmp/.X11-unix:ro")
     fi
 
-    local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    if [[ -d "$xdg_runtime" ]]; then
-        args+=(--volume "$xdg_runtime:$xdg_runtime")
-        # Shadow podman's runtime state with empty container-local volumes so a
-        # nested rootless podman keeps its runroot and pause file to itself
-        # rather than clobbering the host's (see README). The GUI sockets at the
-        # top level of XDG_RUNTIME_DIR are unaffected. Anonymous volumes, not
-        # tmpfs: an older crun (e.g. on Fedora 43) rejects a tmpfs mounted
-        # inside a bind mount with "crun: read: Invalid argument".
-        args+=(--volume "$xdg_runtime/containers")
-        args+=(--volume "$xdg_runtime/libpod")
-    fi
+    local xdg_runtime socket
+    xdg_runtime="$(resolved_runtime_dir)" || return
+    # Keep runtime state local. Never expose the host's Podman/systemd sockets
+    # merely because they happen to be in XDG_RUNTIME_DIR.
+    # Podman rejects uid=/gid= here. Assign ownership after each start instead.
+    args+=(--tmpfs "$xdg_runtime:rw,mode=0700,notmpcopyup")
+    local wayland="${WAYLAND_DISPLAY:-wayland-0}"
+    [[ "$wayland" == /* ]] || wayland="$xdg_runtime/$wayland"
+    for socket in "$wayland" "$xdg_runtime/pulse/native" "$xdg_runtime/pipewire-0"; do
+        [[ -S "$socket" ]] && volume_safe "$socket" && args+=(--volume "$socket:$socket")
+    done
 
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         local dbus_path="${DBUS_SESSION_BUS_ADDRESS#unix:path=}"
-        if [[ "$dbus_path" != "$DBUS_SESSION_BUS_ADDRESS" && -e "$dbus_path" ]]; then
+        dbus_path="${dbus_path%%,*}"
+        if [[ "$dbus_path" == /* && -S "$dbus_path" ]] && volume_safe "$dbus_path"; then
             args+=(--volume "$dbus_path:$dbus_path")
         fi
     fi
 
-    if [[ -n "${SSH_AUTH_SOCK:-}" && -e "$SSH_AUTH_SOCK" ]]; then
-        args+=(--volume "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK")
+    if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
+        if volume_safe "$SSH_AUTH_SOCK"; then
+            args+=(--volume "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK")
+        else
+            # A ':' (the src:dest separator), tab, or newline in the path cannot
+            # go in a --volume spec, so the agent is not forwarded. Say so rather
+            # than dropping it silently, matching the wrapper's other skip notices.
+            echo "Warning: not forwarding the SSH agent; SSH_AUTH_SOCK contains a ':', tab, or newline that cannot be used in a volume mount." >&2
+        fi
     fi
 
     if [[ -d /run/systemd/journal ]]; then
@@ -822,25 +931,93 @@ build_host_integration_args() {
     printf '%s\n' "${args[@]}"
 }
 
+require_rootless() {
+    local info rootless
+    if [[ $(id -u) == 0 || -n "${CONTAINER_HOST:-}${CONTAINER_CONNECTION:-}" ]]; then
+        echo 'Error: toolboxer requires local, rootless Podman.' >&2
+        return 1
+    fi
+    info="$(podman info --format '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} {{.Host.OCIRuntime.Name}}')" || return
+    read -r rootless PODMAN_SELINUX PODMAN_RUNTIME <<< "$info"
+    [[ "$rootless" == true ]] || { echo 'Error: Podman must be rootless.' >&2; return 1; }
+}
+
+require_managed_container() {
+    local managed
+    managed="$(podman inspect --format '{{index .Config.Labels "toolboxer"}}' "$CONTAINER_NAME")" || return
+    [[ "$managed" == true ]] || { echo "Error: '$CONTAINER_NAME' is not a toolboxer container." >&2; return 1; }
+}
+
+validate_container_mode() {
+    local info actual_priv network pid ipc label mode agents names uts
+    local actual_binds expected_binds spec
+    require_managed_container || return
+    info="$(podman inspect --format \
+        '{{.HostConfig.Privileged}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.PidMode}}|{{.HostConfig.IpcMode}}|{{.ProcessLabel}}|{{index .Config.Labels "toolboxer.mode"}}|{{index .Config.Labels "toolboxer.agents"}}|{{index .Config.Labels "toolboxer.agent-names"}}|{{.HostConfig.UTSMode}}' \
+        "$CONTAINER_NAME")" || return
+    IFS='|' read -r actual_priv network pid ipc label mode agents names uts <<< "$info"
+    if [[ "$isolated" == true || "$mode" == isolated ]]; then
+        if [[ "$actual_priv" != false || "$mode" != isolated \
+            || "$network" == host || "$network" == container:* || "$network" == ns:* \
+            || ( "$pid" != private && -n "$pid" ) || ( "$ipc" != private && -n "$ipc" ) \
+            || ( "$uts" != private && -n "$uts" ) \
+            || ( "${PODMAN_SELINUX:-false}" == true && "$label" != *:container_t:* ) ]]; then
+            echo "Error: '$CONTAINER_NAME' does not satisfy --isolated; recreate it with --isolated." >&2
+            return 1
+        fi
+        expected_binds="$(podman inspect --format '{{index .Config.Labels "toolboxer.binds"}}' "$CONTAINER_NAME")" || return
+        actual_binds="$(podman inspect --format \
+            '{{range .Mounts}}{{if eq .Type "bind"}}{{printf "%s:%s\n" .Source .Destination}}{{end}}{{end}}' "$CONTAINER_NAME")" || return
+        if [[ "$(printf '%s\n' "$actual_binds" | sed '/^$/d' | sort)" != "$(printf '%s\n' "$expected_binds" | sed '/^$/d' | sort)" ]]; then
+            echo "Error: '$CONTAINER_NAME' has unexpected bind mounts; check containers.conf and recreate it." >&2
+            return 1
+        fi
+    fi
+    if [[ ${#cli_mounts[@]} -gt 0 && "${cmd:-}" != create ]]; then
+        actual_binds="$(podman inspect --format \
+            '{{range .Mounts}}{{if eq .Type "bind"}}{{printf "%s:%s\n" .Source .Destination}}{{end}}{{end}}' "$CONTAINER_NAME")" || return
+        for spec in "${MOUNT_SPECS[@]}"; do
+            if ! grep -Fxq -- "$spec" <<< "$actual_binds"; then
+                echo "Error: mount '$spec' is absent from '$CONTAINER_NAME'; recreate it to change mounts." >&2
+                return 1
+            fi
+        done
+    fi
+    if [[ -n "$cli_privileged" && "$cli_privileged" != "$actual_priv" ]] \
+        || [[ "$cli_isolated" == false && "$mode" == isolated ]] \
+        || [[ -n "$cli_ai_agents" && "$cli_ai_agents" != "$agents" ]] \
+        || [[ ${#cli_agents[@]} -gt 0 && "$AGENT_SELECTION" != "$names" ]]; then
+        echo "Error: requested creation flags do not match '$CONTAINER_NAME'; recreate it to change them." >&2
+        return 1
+    fi
+}
+
 build_env_args() {
     local args=()
 
     [[ -n "${DISPLAY:-}" ]]                && args+=(--env "DISPLAY=$DISPLAY")
-    [[ -n "${WAYLAND_DISPLAY:-}" ]]        && args+=(--env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && args+=(--env "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
-    [[ -n "${SSH_AUTH_SOCK:-}" ]]          && args+=(--env "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+    # A newline in a forwarded value would split into stray create arguments,
+    # because collect_args reads builder output with mapfile -t. Drop such a
+    # value rather than corrupt the argv. Colons are legitimate here (D-Bus uses
+    # unix:path=), so, unlike a volume path, only newlines are rejected.
+    [[ -n "${WAYLAND_DISPLAY:-}" && "$WAYLAND_DISPLAY" != *$'\n'* ]] \
+        && args+=(--env "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" && "$DBUS_SESSION_BUS_ADDRESS" != *$'\n'* ]] \
+        && args+=(--env "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+    [[ -n "${SSH_AUTH_SOCK:-}" && "$SSH_AUTH_SOCK" != *$'\n'* ]] \
+        && args+=(--env "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
     [[ -n "${TERM:-}" ]]                   && args+=(--env "TERM=$TERM")
     [[ -n "${LANG:-}" ]]                   && args+=(--env "LANG=$LANG")
 
-    local xdg_runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    local xdg_runtime
+    xdg_runtime="$(resolved_runtime_dir)" || return
     args+=(--env "XDG_RUNTIME_DIR=$xdg_runtime")
 
     printf '%s\n' "${args[@]}"
 }
 
-# Home-relative config/data paths for popular AI agent CLIs. With --ai-agents,
-# any that exist on the host are bind-mounted into the container at the same
-# path (see README). Missing paths are skipped, so extra candidates are safe.
+# Home-relative agent paths. Selected directories are shared; existing individual
+# files are copied at creation. Missing files are skipped (see README).
 AI_AGENT_PATHS=(
     .claude .claude.json                        # Claude Code (Anthropic)
     .codex                                      # OpenAI Codex
@@ -864,137 +1041,543 @@ build_ai_agent_args() {
     local args=() p opt=""
     [[ -n "$relabel" ]] && opt=":$relabel"
     for p in "${AI_AGENT_PATHS[@]}"; do
-        # No SELinux relabel by default (label=disable); --isolated passes "z".
-        [[ -e "$HOME/$p" ]] && args+=(--volume "$HOME/$p:$HOME/$p$opt")
+        agent_selected "$p" || continue
+        mount_covers "$HOME/$p" && continue
+        local src
+        src="$(agent_source "$p")" || return
+        # Read realpath's NUL-terminated output so a newline in the resolved
+        # name survives; plain $() strips trailing newlines and could turn a
+        # symlink to a newline-named directory into the bare home, bypassing
+        # validation.
+        IFS= read -r -d '' src < <(realpath -mz -- "$src") || return
+        validate_agent_source "$src" "$p" || return
+        ensure_ai_agent_source "$src" "$p" || return
+        # Individual files are copied at creation, so atomic replacements work.
+        [[ -d "$src" ]] && args+=(--volume "$src:$HOME/$p$opt")
     done
-    [[ ${#args[@]} -gt 0 ]] && printf '%s\n' "${args[@]}"
+    if [[ ${#args[@]} -gt 0 ]]; then printf '%s\n' "${args[@]}"; fi
+}
+
+agent_selected() {
+    local name="${1##*/}" selection=" ${AGENT_SELECTION:-all} "
+    case "$name" in
+        .claude|.claude.json) name=claude ;;
+        .aider.*) name=aider ;;
+        github-copilot|.copilot) name=copilot ;;
+        io.datasette.llm) name=llm ;;
+        shell_gpt) name=sgpt ;;
+        open-interpreter) name=interpreter ;;
+        .*) name="${name#.}" ;;
+    esac
+    [[ "$selection" == *' all '* || "$selection" == *" $name "* ]]
+}
+
+agent_source() {
+    local out
+    case "$1" in
+        .config/*) out="${XDG_CONFIG_HOME:-$HOME/.config}/${1#.config/}" ;;
+        .local/share/*) out="${XDG_DATA_HOME:-$HOME/.local/share}/${1#.local/share/}" ;;
+        .codex) out="${CODEX_HOME:-$HOME/.codex}" ;;
+        .claude) out="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ;;
+        *) out="$HOME/$1" ;;
+    esac
+    # Reject a ':'/tab/newline in an env-var-derived source here, at discovery,
+    # before a caller's command substitution can strip a trailing newline and
+    # silently change which directory the value names. realpath resolution of a
+    # symlink target is guarded separately by the NUL-safe read in the callers.
+    if [[ "$out" == *:* || "$out" == *$'\n'* || "$out" == *$'\t'* ]]; then
+        echo "Error: agent source for '$1' contains an invalid ':', tab, or newline." >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
+# An agent source can come from CLAUDE_CONFIG_DIR, CODEX_HOME or the XDG env
+# vars, so validate it like a user mount before it is created, copied, or
+# bind-mounted. It must be an absolute path; not '/'; not the home or an
+# ancestor of it (either would share the whole home — SSH keys, gnupg, browser
+# profiles — as one agent directory); and free of the ':'/tab/newline that
+# would corrupt a --volume spec. The caller passes a canonicalised src, so the
+# home is canonicalised here too: comparing raw $HOME would miss a symlinked or
+# dot-segment home whose physical path differs from its spelling.
+validate_agent_source() {
+    local src="$1" name="$2" canon_home
+    canon_home="$(realpath -m -- "$HOME")" || return 1
+    if [[ "$src" != /* || "$src" == / || "$src" == "$canon_home" || "$canon_home" == "$src"/* \
+        || "$src" == *:* || "$src" == *$'\n'* || "$src" == *$'\t'* ]]; then
+        echo "Error: refusing agent source for '$name': '$src' must be a specific directory, not '/', your home, or an ancestor of it." >&2
+        return 1
+    fi
+}
+
+mount_covers() {
+    local spec destination
+    for spec in "${MOUNT_SPECS[@]}"; do
+        destination="${spec#*:}"
+        [[ "$1" == "$destination" || "$1" == "$destination/"* ]] && return 0
+    done
+    return 1
+}
+
+copy_agent_files() (
+    local stage p source copied=false
+    stage="$(mktemp -d)" || return
+    trap 'rm -rf -- "$stage"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    for p in "${AI_AGENT_PATHS[@]}"; do
+        agent_selected "$p" || continue
+        mount_covers "$HOME/$p" && continue
+        source="$(agent_source "$p")" || return
+        IFS= read -r -d '' source < <(realpath -mz -- "$source") || return
+        validate_agent_source "$source" "$p" || return
+        [[ -f "$source" ]] || continue
+        install -D -m 600 -- "$source" "$stage$HOME/$p" || return
+        copied=true
+    done
+    if [[ "$copied" == true ]]; then podman cp "$stage/." "$CONTAINER_NAME:/"; fi
+)
+
+# Runs only from the EXIT trap armed after a successful podman create, when a
+# later setup step fails. It removes exactly that container by immutable ID,
+# never by name, so a replacement created under the same name is safe, and
+# without --force: Podman refuses to remove a container that has started,
+# which closes the race with a concurrent start without a separate state
+# check. The original failure status survives even when the cleanup fails.
+discard_created_container() {
+    local status=$? id="$1"
+    if ! podman rm --volumes "$id" >/dev/null; then
+        echo "Error: could not remove partially created container $id; remove it with: podman rm --volumes $id" >&2
+    fi
+    exit "$status"
 }
 
 # The agent paths that were actually found, for display.
 found_ai_agents() {
     local p found=()
     for p in "${AI_AGENT_PATHS[@]}"; do
-        [[ -e "$HOME/$p" ]] && found+=("$p")
+        agent_selected "$p" || continue
+        [[ -e "$(agent_source "$p")" ]] && found+=("$p")
     done
     printf '%s\n' "${found[*]}"
 }
 
 default_workdir() {
-    # workdir = where the first mount lands (its dest).
-    parse_mount_spec "${MOUNT_SPECS[0]}"
-    echo "$_MOUNT_DEST"
+    local spec
+    for spec in "${MOUNT_SPECS[@]}"; do
+        parse_mount_spec "$spec"
+        if [[ -d "$_MOUNT_SRC" || ! -e "$_MOUNT_SRC" ]]; then
+            printf '%s\n' "$_MOUNT_DEST"
+            return
+        fi
+    done
+    printf '/tmp\n'
 }
 
-setup_user_in_container() {
+# Use saved container state, mapping the host cwd through the most specific
+# directory bind mount when possible. Config edits do not alter old containers.
+container_workdir() {
+    local saved mounts source destination host_cwd best_source="" result
+    saved="$(podman inspect --format '{{.Config.WorkingDir}}' "$CONTAINER_NAME")" || return
+    mounts="$(podman inspect --format \
+        '{{range .Mounts}}{{if eq .Type "bind"}}{{printf "%s\t%s\n" .Source .Destination}}{{end}}{{end}}' \
+        "$CONTAINER_NAME")" || return
+    host_cwd="$(pwd -P)"
+    result="${saved:-/tmp}"
+    while IFS=$'\t' read -r source destination; do
+        [[ -n "$source" && -n "$destination" && -d "$source" ]] || continue
+        source="${source%/}"
+        if [[ "$host_cwd" == "$source" || "$host_cwd" == "$source/"* ]]; then
+            if [[ ${#source} -ge ${#best_source} ]]; then
+                best_source="$source"
+                result="${destination%/}${host_cwd#"$source"}"
+            fi
+        fi
+    done <<< "$mounts"
+    printf '%s\n' "${result:-/}"
+}
+
+# Local-file preflight only: NSS-backed allocations and an existing Podman
+# namespace may differ. The actual Podman operation remains authoritative.
+SUBID_MIN_COUNT=65536
+
+subid_file_maps_user() {
+    local file="$1" min_count="${2:-$SUBID_MIN_COUNT}"
+    local name uid
+    name="$(id -un)"
+    uid="$(id -u)"
+    [[ -f "$file" && -r "$file" ]] || return 1
+    awk -F: -v n="$name" -v u="$uid" -v min="$min_count" '
+        /^[[:space:]]*#/ || NF < 3 { next }
+        ($1 == n || $1 == u) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { count += $3 }
+        END { exit count >= min ? 0 : 1 }
+    ' "$file"
+}
+
+subid_file_root_owned() {
+    local file="$1"
+    [[ "$(stat -c '%u' "$file" 2>/dev/null || echo x)" == 0 ]]
+}
+
+host_subid_range_ok() {
+    local subuid="${1:-${SUBUID_FILE:-/etc/subuid}}"
+    local subgid="${2:-${SUBGID_FILE:-/etc/subgid}}"
+    subid_file_root_owned "$subuid" && subid_file_maps_user "$subuid" \
+        && subid_file_root_owned "$subgid" && subid_file_maps_user "$subgid"
+}
+
+# Human-readable reason a subid file is unusable (for the error). Empty = ok.
+subid_file_problem() {
+    local file="$1" owner
+    if [[ ! -e "$file" ]]; then
+        echo "missing"
+        return
+    fi
+    if [[ ! -r "$file" ]]; then
+        echo "unreadable"
+        return
+    fi
+    owner="$(stat -c '%u' "$file" 2>/dev/null || echo x)"
+    if [[ "$owner" != 0 ]]; then
+        echo "owned by uid $owner (must be root)"
+        return
+    fi
+    if ! subid_file_maps_user "$file"; then
+        if [[ ! -s "$file" ]]; then
+            echo "empty (no range for $(id -un))"
+        else
+            echo "no range of at least $SUBID_MIN_COUNT UIDs for $(id -un)"
+        fi
+        return
+    fi
+}
+
+# Warn about local configuration without claiming that startup will succeed.
+warn_host_subids() {
+    local subuid="${SUBUID_FILE:-/etc/subuid}"
+    local subgid="${SUBGID_FILE:-/etc/subgid}"
+    if host_subid_range_ok "$subuid" "$subgid"; then
+        return 0
+    fi
+    echo "Warning: no usable subuid/subgid range for '$(id -un)'." >&2
+    echo "         Local files do not confirm the recommended allocation; NSS-backed" >&2
+    echo "         allocations may differ. Podman startup or sudo may fail without" >&2
+    echo "         a working UID/GID mapping." >&2
+    echo >&2
+    echo "         $subuid: $(subid_file_problem "$subuid")" >&2
+    echo "         $subgid: $(subid_file_problem "$subgid")" >&2
+    echo >&2
+    echo "Ask your host administrator to allocate non-overlapping UID/GID ranges" >&2
+    echo "and ensure newuidmap/newgidmap work. usermod --add-subuids START-END" >&2
+    echo "--add-subgids START-END can add an allocation after checking other users." >&2
+    echo "After correcting host mappings, use podman system migrate and recreate" >&2
+    echo "affected containers, preserving any container-local work first." >&2
+}
+
+# Run inside the container as root. Everything in an unmounted home belongs to
+# the matching user, including artifacts left root-owned by older toolboxer
+# versions. Paths at or below a mount destination are pruned so recursive repair
+# never changes a bind-mounted host file. Symlinks are changed without following
+# them for the same reason.
+repair_home_tree() {
+    local uid="$1" gid="$2" user_home="$3"
+    shift 3
+    local owner="$uid:$gid"
+    local -a mounted_paths=("$@")
+
+    repair_home_path() {
+        local path="$1" mounted child
+        [[ -e "$path" || -L "$path" ]] || return 0
+
+        for mounted in "${mounted_paths[@]}"; do
+            # Podman's Go template currently leaves a trailing blank line for
+            # this range. An empty value makes "$mounted"/* expand as the
+            # pattern /*, which matches every absolute path and silently prunes
+            # the whole home tree.
+            [[ -n "$mounted" ]] || continue
+            case "$path" in
+                "$mounted"|"$mounted"/*) return 0 ;;
+            esac
+        done
+
+        if [[ -L "$path" ]]; then
+            chown -h -- "$owner" "$path"
+            return 0
+        fi
+
+        chown -- "$owner" "$path"
+        if [[ -d "$path" ]]; then
+            for child in "$path"/*; do
+                repair_home_path "$child"
+            done
+        fi
+    }
+
+    mkdir -p -- "$user_home"
+    shopt -s dotglob nullglob
+    repair_home_path "$user_home"
+}
+
+# Make the container-local parts of the user's home writable without changing
+# any bind-mounted source. Podman creates intermediate mount directories as root
+# (e.g. ~/.local for ~/.local/share/goose), while older containers may contain
+# other root-owned artifacts such as ~/.cache. Send the actual mount list into
+# the container so repair_home_tree can safely prune every host-backed subtree.
+ensure_writable_home() {
     local cname="$1"
-    local uid gid user_name user_shell user_home
+    local uid gid user_home destination mount_destinations
+    local -a destinations=()
     uid="$(id -u)"
     gid="$(id -g)"
-    user_name="$(id -un)"
-    # The host's login shell isn't guaranteed to exist in the container, so
-    # default to bash (always present in toolbox-style images).
-    user_shell="/bin/bash"
     user_home="$HOME"
 
-    # Make the in-container user match the host (same UID/GID and name) so file
-    # ownership lines up and the sudoers entry below applies. A generic image may
-    # ship a stock account already occupying the host UID/GID — Ubuntu's
-    # ubuntu:1000 is the common case — so rename it rather than failing to add
-    # ours (a plain useradd -u would collide on the in-use UID).
-    podman exec --user root -i "$cname" bash -s -- \
-        "$uid" "$gid" "$user_name" "$user_home" "$user_shell" <<'SETUP' || true
-set -e
-uid="$1"; gid="$2"; user_name="$3"; user_home="$4"; user_shell="$5"
-
-# Group: rename whatever holds the host GID to our name, else create it.
-existing_group="$(getent group "$gid" | cut -d: -f1 || true)"
-if [ -n "$existing_group" ]; then
-    [ "$existing_group" != "$user_name" ] && groupmod -n "$user_name" "$existing_group"
-elif ! getent group "$user_name" >/dev/null 2>&1; then
-    groupadd -g "$gid" "$user_name"
-fi
-
-# User: rename whatever holds the host UID to our name (fixing home/shell/group),
-# else create it. usermod -l renames the colliding account (e.g. ubuntu).
-existing_user="$(getent passwd "$uid" | cut -d: -f1 || true)"
-if [ -n "$existing_user" ]; then
-    if [ "$existing_user" != "$user_name" ]; then
-        usermod -l "$user_name" -d "$user_home" -s "$user_shell" -g "$gid" "$existing_user"
-    else
-        usermod -d "$user_home" -s "$user_shell" -g "$gid" "$user_name"
+    # Never recurse unless the full mount list was obtained: losing that list
+    # would make bind-mounted host paths indistinguishable from local overlay
+    # content. Some Podman versions also append a blank line to the expansion;
+    # filter it here as well as defending inside repair_home_tree.
+    if ! mount_destinations="$(podman inspect --format \
+        '{{range .Mounts}}{{println .Destination}}{{end}}' "$cname")"; then
+        echo "Error: could not inspect mounts for container '$cname'; refusing to repair its home." >&2
+        return 1
     fi
-elif ! id "$user_name" >/dev/null 2>&1; then
-    useradd -u "$uid" -g "$gid" -d "$user_home" -s "$user_shell" -M "$user_name"
-fi
-SETUP
+    while IFS= read -r destination; do
+        [[ -n "$destination" ]] && destinations+=("$destination")
+    done <<< "$mount_destinations"
 
-    # Give the user a writable home. When mounts sit under $HOME (the default
-    # ~/code), podman auto-creates $HOME as a root-owned mount parent, so the
-    # user can't write to it. Create it if missing and hand it over -- not
-    # recursive, so the mounted dirs inside keep their own owners. Left empty by
-    # design (no /etc/skel seeding): bring dotfiles via a mount or the provision
-    # script, rather than us dropping files the user didn't ask for.
-    podman exec --user root "$cname" mkdir -p "$user_home"
-    podman exec --user root "$cname" chown "$uid:$gid" "$user_home"
+    {
+        declare -f repair_home_tree
+        printf '%s\n' 'set -euo pipefail' 'repair_home_tree "$@"'
+    } | podman exec --user root -i "$cname" \
+        bash --noprofile --norc -s -- \
+        "$uid" "$gid" "$user_home" "${destinations[@]}" || return
 
-    # Ensure sudo is installed — Fedora/RHEL toolbox images ship it, but the
-    # generic ubuntu/arch/openSUSE images we support via --distro don't. The block
-    # ends with `command -v sudo`, so its exit status reports whether sudo is
-    # actually present afterwards: a failed install (no network, a broken repo, or
-    # an unhandled package manager in a custom --image) is otherwise swallowed and
-    # only surfaces later as a baffling sudo error.
-    local have_sudo=false
-    if podman exec --user root "$cname" bash -c '
-        command -v sudo >/dev/null 2>&1 && exit 0
-        if command -v dnf >/dev/null 2>&1; then
-            dnf install -y sudo >/dev/null 2>&1
-        elif command -v apt-get >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y sudo >/dev/null 2>&1
-        elif command -v pacman >/dev/null 2>&1; then
-            pacman -Sy --noconfirm sudo >/dev/null 2>&1
-        elif command -v zypper >/dev/null 2>&1; then
-            zypper --non-interactive install sudo >/dev/null 2>&1
-        fi
-        command -v sudo >/dev/null 2>&1
-    '; then
-        have_sudo=true
-    else
-        echo "Warning: could not install sudo in the container; sudo will not work." >&2
-        echo "         Install it as root, or use a custom image (-i) with sudo preinstalled." >&2
+    # Do not write the one-time marker after a silent no-op: verify the local
+    # home parents as the user who must actually install and run tools there.
+    if ! podman exec --user "$uid:$gid" "$cname" sh -c '
+        for path do
+            [ ! -e "$path" ] || [ -w "$path" ] || exit 1
+        done
+    ' sh "$user_home" "$user_home/.local" "$user_home/.local/share" "$user_home/.cache"; then
+        echo "Error: failed to make '$user_home' writable in container '$cname'." >&2
+        return 1
     fi
+}
 
-    # Grant passwordless sudo. Validate the drop-in with visudo so a malformed
-    # file surfaces here instead of silently falling back to a password prompt.
-    # Only validate when sudo is present — visudo ships with sudo, so a sudo-less
-    # container would otherwise fail this with a misleading "did not validate".
-    podman exec --user root "$cname" mkdir -p /etc/sudoers.d
-    podman exec --user root "$cname" bash -c "echo '$user_name ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$user_name && chmod 440 /etc/sudoers.d/$user_name"
-    if [[ "$have_sudo" == true ]] && ! podman exec --user root "$cname" visudo -cf "/etc/sudoers.d/$user_name" >/dev/null 2>&1; then
-        echo "Warning: passwordless-sudo setup for '$user_name' did not validate; sudo may prompt for a password." >&2
-    fi
+# v1 could be written after Podman's trailing blank mount entry made the repair
+# a silent no-op. A new marker forces every affected existing container through
+# the corrected, verified repair once.
+HOME_REPAIR_MARKER="/etc/.toolboxer-home-repaired-v2"
+SETUP_MARKER="/etc/.toolboxer-setup-v1"
 
-    # Default the nested podman to host networking so it needs no /dev/net/tun
-    # (see README). A drop-in merges with the image's own containers.conf.
-    podman exec --user root "$cname" bash -c '
-        mkdir -p /etc/containers/containers.conf.d
-        cat > /etc/containers/containers.conf.d/90-toolboxer-nested.conf <<EOF
-# Added by toolboxer: host networking for nested (podman-in-podman) containers
-# so no /dev/net/tun is needed. Override per-container with e.g. --network pasta.
-[containers]
-netns="host"
-EOF
-    ' || true
+mark_home_repaired() {
+    podman exec --user root "$1" touch "$HOME_REPAIR_MARKER"
+}
 
-    # Mark interactive shells with a magenta hexagon, like toolbox. The full
-    # prompt is set (not prepended) so it survives the image's bashrc; a
-    # mounted ~/.bashrc still overrides it.
+configure_user_profile() {
+    local cname="$1"
+    # Mark interactive shells with a magenta hexagon, like toolbox, and expose
+    # the conventional destination used by user-level CLI installers. The full
+    # prompt is set (not prepended) so it survives the image's bashrc; a mounted
+    # ~/.bashrc still overrides it.
     podman exec --user root -i "$cname" \
-        tee /etc/profile.d/toolboxer.sh >/dev/null <<'PROFILE' || true
-# Added by toolboxer: magenta hexagon prompt marker (like toolbox).
+        tee /etc/profile.d/toolboxer.sh >/dev/null <<'PROFILE'
+# Added by toolboxer: user-local commands and prompt marker.
+# User-level CLI installers (Claude, Codex, Cursor, pipx, etc.) conventionally
+# place executables here. Login shells must see them even when the image starts
+# PID 1 as root and its saved PATH contains only system directories.
+case ":$PATH:" in
+    *:"$HOME/.local/bin":*) ;;
+    *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+export PATH
+
 if [ -n "${PS1-}" ]; then
     PS1="\[\e[1;35m\]⬢\[\e[0m\] [\u@\h \W]\$ "
 fi
 PROFILE
+}
+
+# Runs inside the container. Repair only sudo's known paths, without replacing
+# binaries, deleting directories, or recursively changing an image/host tree.
+repair_sudo_metadata() {
+    local sudo_bin="$1" sudo_conf="$2" sudoers="$3" sudoers_dir="$4"
+    shift 4
+    local path resolved mounted owner mode
+    local -a binds=() paths=("$sudo_bin" "$sudoers_dir")
+    for mounted do
+        [[ -n "$mounted" ]] || continue
+        mounted="$(realpath -m -- "$mounted")" || return
+        binds+=("$mounted")
+    done
+    [[ ! -e "$sudo_conf" && ! -L "$sudo_conf" ]] || paths+=("$sudo_conf")
+    # openSUSE Leap and some others ship no /etc/sudoers, relying entirely on
+    # /etc/sudoers.d. Repair the main file only when present; the toolboxer
+    # drop-in under sudoers_dir still grants passwordless sudo, and the later
+    # 'sudo -n true' check verifies sudo actually works.
+    [[ ! -e "$sudoers" && ! -L "$sudoers" ]] || paths+=("$sudoers")
+    for path in "$sudoers_dir"/*; do
+        [[ ! -f "$path" && ! -L "$path" ]] || paths+=("$path")
+    done
+
+    # Validate the entire target set before the first mutation. Resolve links
+    # in both targets and mount destinations so aliases cannot bypass this.
+    for path in "${paths[@]}"; do
+        resolved="$(realpath -m -- "$path")" || return
+        if [[ "$resolved" == *$'\n'* || "$resolved" == *$'\t'* ]]; then
+            echo 'Error: ambiguous sudo path; refusing metadata repair.' >&2
+            return 1
+        fi
+        for mounted in "${binds[@]}"; do
+            if [[ "$mounted" == / || "$resolved" == "$mounted" || "$resolved" == "$mounted"/* ]]; then
+                echo "Error: refusing sudo setup through host bind mount '$mounted' (path '$path')." >&2
+                return 1
+            fi
+        done
+        if [[ "$path" == "$sudoers_dir" && ! -L "$path" && ! -e "$path" ]]; then
+            continue
+        fi
+        if [[ ( "$path" == "$sudoers_dir" && ! -d "$path" ) \
+            || ( "$path" != "$sudoers_dir" && ! -f "$path" ) ]]; then
+            echo "Error: missing or unexpected sudo path '$path'." >&2
+            return 1
+        fi
+    done
+    mkdir -p -- "$sudoers_dir" || return
+    for path in "${paths[@]}"; do
+        owner="$(stat -Lc '%u:%g' -- "$path")" || return
+        mode="$(stat -Lc '%a' -- "$path")" || return
+        if [[ "$owner" != 0:0 ]] || (( (8#$mode & 0022) != 0 )) \
+            || [[ "$path" == "$sudo_bin" && ! -u "$path" ]]; then
+            echo "Repairing container-local sudo metadata: $path (owner=$owner mode=$mode)" >&2
+        else
+            continue
+        fi
+        if [[ "$owner" != 0:0 ]] && ! chown -- 0:0 "$path"; then
+            echo "Error: could not restore root ownership of '$path' (was $owner, mode $mode)." >&2
+            return 1
+        fi
+        # chown can clear setuid, so restore it afterwards. Preserve all other
+        # access bits except unsafe group/other write permissions.
+        if [[ "$path" == "$sudo_bin" ]]; then
+            chmod u+s,go-w -- "$path" || return
+        else
+            chmod go-w -- "$path" || return
+        fi
+        owner="$(stat -Lc '%u:%g' -- "$path")" || return
+        mode="$(stat -Lc '%a' -- "$path")" || return
+        if [[ "$owner" != 0:0 ]] || (( (8#$mode & 0022) != 0 )) \
+            || [[ "$path" == "$sudo_bin" && ! -u "$path" ]]; then
+            echo "Error: sudo metadata repair did not persist for '$path' (owner=$owner mode=$mode)." >&2
+            return 1
+        fi
+    done
+}
+
+ensure_sudo_metadata() {
+    local cname="$1" destinations destination
+    local -a binds=()
+    destinations="$(podman inspect --format \
+        '{{range .Mounts}}{{if eq .Type "bind"}}{{println .Destination}}{{end}}{{end}}' "$cname")" || return
+    while IFS= read -r destination; do
+        [[ -z "$destination" ]] || binds+=("$destination")
+    done <<< "$destinations"
+    {
+        declare -f repair_sudo_metadata
+        # shellcheck disable=SC2016
+        printf '%s\n' 'set -euo pipefail' \
+            'repair_sudo_metadata "$(type -P sudo)" /etc/sudo.conf /etc/sudoers /etc/sudoers.d "$@"'
+    } | podman exec --user root -i "$cname" bash --noprofile --norc -s -- "${binds[@]}"
+}
+
+setup_user_in_container() {
+    local cname="$1" uid gid user_name
+    uid="$(id -u)"; gid="$(id -g)"; user_name="$(id -un)"
+    if ! podman exec --user root -i "$cname" bash --noprofile --norc -s -- \
+        "$uid" "$gid" "$user_name" "$HOME" <<'SETUP'
+set -euo pipefail
+uid="$1"; gid="$2"; user_name="$3"; user_home="$4"
+for tool in getent groupadd useradd usermod; do
+    command -v "$tool" >/dev/null || { echo "Required image command missing: $tool" >&2; exit 1; }
+done
+if ! getent group "$gid" >/dev/null; then
+    group_name="$user_name"
+    if getent group "$group_name" >/dev/null; then group_name="toolboxer-$gid"; fi
+    groupadd -g "$gid" -- "$group_name"
+fi
+existing_user="$(getent passwd "$uid" | cut -d: -f1 || true)"
+named_uid="$(id -u "$user_name" 2>/dev/null || true)"
+if [[ -n "$named_uid" && "$named_uid" != "$uid" ]]; then
+    [[ -z "$existing_user" ]] || { echo "Both username and UID are occupied by different accounts." >&2; exit 1; }
+    # usermod -u recursively changes the account's home ownership. Point it at
+    # an empty local directory first so it cannot traverse a host bind mount.
+    scratch="$(mktemp -d)"
+    trap 'rmdir -- "$scratch"' EXIT
+    usermod -d "$scratch" -- "$user_name"
+    usermod -u "$uid" -- "$user_name"
+    existing_user="$user_name"
+fi
+if [[ -n "$existing_user" ]]; then
+    if [[ "$existing_user" != "$user_name" ]]; then usermod -l "$user_name" -- "$existing_user"; fi
+    usermod -d "$user_home" -s /bin/bash -g "$gid" -- "$user_name"
+else
+    useradd -u "$uid" -g "$gid" -d "$user_home" -s /bin/bash -M -- "$user_name"
+fi
+[[ "$(id -u "$user_name")" == "$uid" && "$(id -g "$user_name")" == "$gid" ]]
+SETUP
+    then
+        echo "Error: could not configure the matching user in '$cname'; setup will retry next time." >&2
+        return 1
+    fi
+
+    ensure_writable_home "$cname" || return
+    if ! podman exec --user root "$cname" bash --noprofile --norc -c '
+        set -e
+        if ! command -v sudo >/dev/null; then
+            if command -v dnf >/dev/null; then
+                dnf install -y sudo
+            elif command -v apt-get >/dev/null; then
+                apt-get update
+                DEBIAN_FRONTEND=noninteractive apt-get install -y sudo
+            elif command -v pacman >/dev/null; then
+                echo "Installing sudo on Arch needs a full system upgrade (pacman -Syu); this can take a while and updates more than sudo." >&2
+                pacman -Syu --noconfirm sudo
+            elif command -v zypper >/dev/null; then
+                zypper --non-interactive install sudo
+            else
+                echo "Unsupported package manager: provide an image with sudo installed." >&2
+                exit 1
+            fi
+        fi
+        command -v sudo >/dev/null
+    ' >&2; then
+        echo "Error: could not install sudo in '$cname'; setup will retry next time." >&2
+        return 1
+    fi
+
+    ensure_sudo_metadata "$cname" || return
+    # Replace only our own validated sudoers drop-in; retain image/user policy.
+    if ! podman exec --user root "$cname" bash --noprofile --norc -c '
+        set -euo pipefail
+        tmp="$(mktemp /etc/sudoers.d/.toolboxer.XXXXXX)"
+        trap '\''rm -f -- "$tmp"'\'' EXIT
+        printf "%s ALL=(ALL) NOPASSWD:ALL\n" "$1" > "$tmp"
+        chmod 440 "$tmp"
+        visudo -cf "$tmp"
+        mv -fT -- "$tmp" /etc/sudoers.d/toolboxer
+    ' bash "$user_name" >&2; then
+        echo "Error: could not install the sudoers policy in '$cname' (see the error above)." >&2
+        return 1
+    fi
+    if ! podman exec --user "$uid:$gid" --env "HOME=$HOME" "$cname" sudo -n true; then
+        echo "Error: passwordless sudo verification failed in '$cname'." >&2
+        return 1
+    fi
+    podman exec --user root "$cname" bash -c '
+        set -e
+        mkdir -p /etc/containers/containers.conf.d
+        printf "[containers]\nnetns=\"host\"\n" > /etc/containers/containers.conf.d/90-toolboxer-nested.conf
+    ' || return
+    configure_user_profile "$cname"
 }
 
 # Run the provision script (if any) in the container as the host user, fed on
@@ -1014,58 +1597,178 @@ run_provision() {
     # Expose the container's actual distro/release (from its os-release) so the
     # script can pick a package manager without re-detecting it.
     local osrel cdistro="" crelease=""
-    osrel="$(podman exec "$cname" sh -c '. /etc/os-release 2>/dev/null && printf "%s %s" "${ID:-}" "${VERSION_ID:-}"' 2>/dev/null)" || true
+    # Only emit output when ID is present, so a bare VERSION_ID cannot be read
+    # as the distro (VERSION_ID is optional for rolling releases, ID is not).
+    osrel="$(podman exec "$cname" sh -c '. /etc/os-release 2>/dev/null; [ -n "${ID:-}" ] && printf "%s %s" "$ID" "${VERSION_ID:-}"' 2>/dev/null)" || true
     read -r cdistro crelease <<< "$osrel" || true
+    # A provision script usually branches on TOOLBOXER_DISTRO, so empty
+    # detection means it would silently take the wrong branch or no-op. Fail an
+    # explicit request; warn but continue an automatic first-use provision.
+    if [[ -z "$cdistro" ]]; then
+        if [[ "$required" == "required" ]]; then
+            echo "Error: could not read the container's distro from /etc/os-release; refusing to provision without it." >&2
+            return 1
+        fi
+        echo "Warning: could not read the container's distro from /etc/os-release; provisioning with empty TOOLBOXER_DISTRO/RELEASE." >&2
+    fi
 
-    echo "Provisioning from $PROVISION_SCRIPT ..."
+    echo "Provisioning from $PROVISION_SCRIPT ..." >&2
     # Run as the host user (passwordless sudo is available for privileged steps)
     # in the container's default working directory (a mounted, writable dir).
+    # PID 1 runs as root, so its saved HOME/PATH can otherwise leak into execs;
+    # set HOME explicitly and expose the standard user-local binary directory.
     podman exec --user "$(id -u):$(id -g)" -i \
+        --env "HOME=$HOME" \
         --env "TOOLBOXER_DISTRO=$cdistro" \
         --env "TOOLBOXER_RELEASE=$crelease" \
-        "$cname" bash -s < "$PROVISION_SCRIPT"
+        "$cname" bash -c \
+        'export PATH="$HOME/.local/bin:$PATH"; exec bash -s' \
+        < "$PROVISION_SCRIPT"
 }
 
 ensure_exists() {
-    podman container exists "$CONTAINER_NAME"
+    local status=0
+    podman container exists "$CONTAINER_NAME" || status=$?
+    case "$status" in
+        0|1) return "$status" ;;
+        *) echo "Error: could not query container '$CONTAINER_NAME'." >&2; exit "$status" ;;
+    esac
 }
 
 ensure_started() {
-    local state
-    state="$(podman inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    # Only the supervisor holds the lock through setup and provisioning. Podman
+    # can pass inherited descriptors to conmon, which outlives initialization.
+    (
+        local lock_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/toolboxer" lock_fd lock_status=0
+        (umask 077; mkdir -p -- "$lock_dir")
+        exec {lock_fd}>"$lock_dir/$CONTAINER_NAME.lock"
+        flock -n -x "$lock_fd" || lock_status=$?
+        case "$lock_status" in
+            0) ;;
+            1)
+                echo "Waiting for initialization lock on '$CONTAINER_NAME' (Ctrl-C to cancel)..." >&2
+                flock -x "$lock_fd"
+                ;;
+            *)
+                echo "Error: could not acquire initialization lock for '$CONTAINER_NAME'." >&2
+                exit "$lock_status"
+                ;;
+        esac
+        (
+            exec {lock_fd}>&-
+            initialize_container "${1:-auto}" >&2
+        )
+    )
+}
 
-    if [[ "$state" == "running" ]]; then
+ensure_runtime_directory() {
+    local runtime_dir="$1" tmpfs_dirs="$2" started="$3" uid_gid
+    # Older integrated containers may bind the host runtime; never chown/chmod it.
+    [[ -n "$runtime_dir" && "$runtime_dir" != '<no value>' ]] || return 0
+    if [[ "$runtime_dir" != /* || "$runtime_dir" == / ]] || ! grep -Fxq -- "$runtime_dir" <<< "$tmpfs_dirs"; then
+        echo "Error: '$CONTAINER_NAME' does not have its recorded private runtime tmpfs; refusing ownership changes." >&2
+        return 1
+    fi
+    uid_gid="$(id -u):$(id -g)"
+    # After a start the tmpfs is fresh and root-owned, so always reown it then.
+    # When the container was already running the reown is redundant only if the
+    # directory already satisfies the whole postcondition: owned by the user and
+    # group with mode exactly 0700, and actually writable by the user. The
+    # owner/group/mode check catches a weaker dir (a lost search bit, e.g. 0600
+    # is writable but unusable; broader permissions than 0700; a wrong owner or
+    # group; a start outside toolboxer that left it root-owned), and running the
+    # same check as the user, with a writability test, also catches an ancestor
+    # the user cannot traverse even when the dir itself looks correct. Both run
+    # in one exec so the warm path stays a single process; anything short of the
+    # full postcondition falls through to the repair and its final user check.
+    if [[ "$started" != true ]] \
+        && podman exec --user "$uid_gid" "$CONTAINER_NAME" sh -eu -c \
+            '[ "$(stat -c "%u:%g:%a" "$1")" = "$2:700" ] && [ -w "$1" ]' sh "$runtime_dir" "$uid_gid"; then
         return 0
     fi
+    podman exec --user root "$CONTAINER_NAME" sh -eu -c '
+        chown -- "$1" "$2"
+        chmod 0700 -- "$2"
+    ' sh "$uid_gid" "$runtime_dir" || return
+    if ! podman exec --user "$uid_gid" "$CONTAINER_NAME" test -w "$runtime_dir"; then
+        echo "Error: private runtime directory '$runtime_dir' is not writable by $uid_gid in '$CONTAINER_NAME'." >&2
+        return 1
+    fi
+}
 
-    # Container is created/stopped — start it. Keep stderr (only the success
-    # output, the container name, goes to /dev/null) so a failure such as a
-    # mount or file-ownership problem is visible instead of being swallowed,
-    # and stop with a clear message rather than failing silently under set -e.
-    if ! podman start "$CONTAINER_NAME" >/dev/null; then
-        echo "Error: failed to start container '$CONTAINER_NAME' (see the podman error above)." >&2
-        exit 1
+initialize_container() {
+    local provisioning="$1"
+    local state runtime_dir tmpfs_dirs meta_raw
+    local -a meta=()
+    # Read the run state and tmpfs list in one inspect instead of two. Both are
+    # safe to pack this way: the state is a single podman-controlled word and the
+    # tmpfs paths are already newline-delimited, so the first line is the state
+    # and any further lines are tmpfs paths. The tmpfs config is fixed at create
+    # time, so reading it before a possible start is correct.
+    meta_raw="$(podman inspect --format \
+        '{{.State.Status}}
+{{range $path, $_ := .HostConfig.Tmpfs}}{{println $path}}{{end}}' "$CONTAINER_NAME")" || return
+    mapfile -t meta <<< "$meta_raw"
+    state="${meta[0]:-}"
+    tmpfs_dirs="$(printf '%s\n' "${meta[@]:1}")"
+    # Query the runtime-dir label on its own. It is untrusted stored metadata
+    # that create validates but may still hold an embedded newline; packing it
+    # with the tmpfs list above would let such a newline masquerade as a tmpfs
+    # entry and bypass ensure_runtime_directory's private-tmpfs guard. A separate
+    # query captures the whole value so that guard sees it intact.
+    runtime_dir="$(podman inspect --format '{{index .Config.Labels "toolboxer.runtime-dir"}}' "$CONTAINER_NAME")" || return
+
+    local started=false
+    if [[ "$state" != "running" ]]; then
+        # Container is created/stopped — start it. Keep stderr (only the success
+        # output, the container name, goes to /dev/null) so a failure such as a
+        # mount or file-ownership problem is visible instead of being swallowed,
+        # and stop with a clear message rather than failing silently under set -e.
+        if ! podman start "$CONTAINER_NAME" >/dev/null; then
+            echo "Error: failed to start container '$CONTAINER_NAME' (see the podman error above)." >&2
+            exit 1
+        fi
+        started=true
     fi
 
-    # The nested-podman runtime volumes (see build_host_integration_args) can
-    # come up root-owned; hand them to our user so the nested podman can use
-    # them.
-    local xdg
-    xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    podman exec --user root "$CONTAINER_NAME" \
-        chown "$(id -u):$(id -g)" "$xdg/containers" "$xdg/libpod" 2>/dev/null || true
+    # Tmpfs ownership resets on restart; also handle starts performed outside
+    # toolboxer. Use saved metadata, not this invocation's XDG_RUNTIME_DIR.
+    ensure_runtime_directory "$runtime_dir" "$tmpfs_dirs" "$started"
 
-    # Run user setup on first start (check if sudoers file exists)
-    local user_name
-    user_name="$(id -un)"
-    if ! podman exec --user root "$CONTAINER_NAME" test -f "/etc/sudoers.d/$user_name" 2>/dev/null; then
-        echo "Setting up user environment..."
+    local provision_marker=/etc/.toolboxer-provisioned-v1
+    # Older releases used the username's sudoers file as their setup sentinel.
+    # Preserve their once-only provisioning behavior, but revalidate setup.
+    # We cannot infer whether a legacy script succeeded; explicit provision is
+    # available for a deliberate retry without surprising upgrade-time writes.
+    if ! podman exec --user root "$CONTAINER_NAME" test -f "$SETUP_MARKER" 2>/dev/null; then
+        if podman exec --user root "$CONTAINER_NAME" test -f "/etc/sudoers.d/$(id -un)" \
+            && podman exec --user root "$CONTAINER_NAME" test -f "$HOME_REPAIR_MARKER"; then
+            podman exec --user root "$CONTAINER_NAME" touch "$provision_marker"
+        fi
+        echo "Setting up user environment..." >&2
         setup_user_in_container "$CONTAINER_NAME"
-        # Provision once, after the user/sudo setup. Best-effort: a failure warns
-        # but leaves the container usable.
-        if ! run_provision "$CONTAINER_NAME"; then
-            echo "Warning: provision script failed; the container is still usable." >&2
-            echo "Re-run it after fixing the script with: $prog provision $CONTAINER_NAME" >&2
+        podman exec --user root "$CONTAINER_NAME" touch "$SETUP_MARKER"
+        mark_home_repaired "$CONTAINER_NAME"
+    elif ! podman exec --user root "$CONTAINER_NAME" \
+        test -f "$HOME_REPAIR_MARKER" 2>/dev/null; then
+        # Repair containers created by older toolboxer versions too. This also
+        # recovers artifacts left by a failed first provision. The marker avoids
+        # recursively walking a potentially large cache on every run.
+        ensure_writable_home "$CONTAINER_NAME"
+        configure_user_profile "$CONTAINER_NAME"
+        mark_home_repaired "$CONTAINER_NAME"
+    fi
+    if [[ "$provisioning" == explicit ]] || ! podman exec --user root "$CONTAINER_NAME" test -f "$provision_marker"; then
+        local required=""
+        [[ "$provisioning" == explicit ]] && required=required
+        if run_provision "$CONTAINER_NAME" "$required"; then
+            podman exec --user root "$CONTAINER_NAME" touch "$provision_marker"
+        else
+            echo "Warning: provisioning failed; fix the script and run '$prog provision $CONTAINER_NAME'." >&2
+            ensure_writable_home "$CONTAINER_NAME"
+            # A failed explicit request is an error. Automatic provisioning is
+            # retried next time; the verified development environment is usable.
+            [[ "$provisioning" != explicit ]] || return 1
         fi
     fi
 }
@@ -1084,13 +1787,13 @@ resolve_container() {
     fi
 
     local containers
-    containers="$(podman container list --all --filter 'label=toolboxer=true' --format '{{.Names}}' 2>/dev/null)"
+    containers="$(podman container list --all --filter 'label=toolboxer=true' --format '{{.Names}}')" || exit "$?"
     local count
     count="$(echo "$containers" | grep -c . 2>/dev/null || true)"
 
     if [[ "$count" -eq 1 ]]; then
         CONTAINER_NAME="$containers"
-        echo "Using container '$CONTAINER_NAME'"
+        echo "Using container '$CONTAINER_NAME'" >&2
         return 0
     fi
 
@@ -1131,17 +1834,113 @@ finalize_names() {
             exit 1
         fi
     fi
+    if is_rolling_distro "${DISTRO:-$HOST_ID}" && [[ -n "$RELEASE" && "$RELEASE" != latest ]]; then
+        echo "Error: '${DISTRO:-$HOST_ID}' is a rolling release; use --release latest." >&2
+        exit 2
+    fi
+    EFFECTIVE_DISTRO="$(canonical_distro "${DISTRO:-$HOST_ID}")"
+    EFFECTIVE_RELEASE="${RELEASE:-$(default_release "$EFFECTIVE_DISTRO")}"
     if [[ -z "$CONTAINER_NAME" ]]; then
         CONTAINER_NAME="$(resolve_name "$DISTRO" "$RELEASE")"
     fi
     if [[ -z "$IMAGE" ]]; then
         IMAGE="$(resolve_image "$DISTRO" "$RELEASE")"
     fi
+    [[ "$CONTAINER_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
+        echo "Error: invalid container name '$CONTAINER_NAME'." >&2; exit 2;
+    }
 }
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
+
+image_state_dir() { printf '%s/toolboxer/images\n' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+
+remember_image() {
+    local id directory temporary
+    id="$(podman image inspect --format '{{.Id}}' "$1")" || return
+    id="${id#sha256:}"
+    [[ "$id" =~ ^[a-f0-9]{64}$ ]] || { echo 'Error: invalid image ID from Podman.' >&2; return 1; }
+    directory="$(image_state_dir)"
+    (umask 077; mkdir -p -- "$directory") || return
+    temporary="$(mktemp "$directory/.image.XXXXXX")" || return
+    if ! printf '%s\n' "$1" > "$temporary" || ! mv -fT -- "$temporary" "$directory/$id"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+managed_image_ids() {
+    local directory file id containers status
+    local -A seen=()
+    directory="$(image_state_dir)"
+    containers="$(podman container list --all --no-trunc --filter label=toolboxer=true --format '{{.ImageID}}')" || return
+    while IFS= read -r id; do
+        id="${id#sha256:}"
+        [[ "$id" =~ ^[a-f0-9]{64}$ ]] && seen["$id"]=1
+    done <<< "$containers"
+    for file in "$directory"/*; do
+        [[ -f "$file" ]] || continue
+        id="${file##*/}"
+        [[ "$id" =~ ^[a-f0-9]{64}$ ]] && seen["$id"]=1
+    done
+    for id in "${!seen[@]}"; do
+        status=0
+        podman image exists "$id" || status=$?
+        case "$status" in
+            0) printf '%s\n' "$id" ;;
+            1) continue ;;
+            *) return "$status" ;;
+        esac
+    done
+    return 0
+}
+
+list_managed_images() {
+    local ids id present status=0
+    ids="$(managed_image_ids)" || return
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        podman image inspect --format '{{.Id}}\t{{join .RepoTags ", "}}\t{{.Created}}' "$id" 2>/dev/null && continue
+        # An image can vanish between enumeration and inspect; that race is not
+        # an error, so drop it without noise (Podman's own inspect error is
+        # suppressed above). Any other inspect failure is real: list the rest
+        # but remember it for a non-zero exit status, with our own warning, so
+        # a storage or permission fault is never reported as success.
+        present=0
+        podman image exists "$id" || present=$?
+        [[ "$present" -eq 1 ]] && continue
+        echo "Warning: could not inspect managed image $id." >&2
+        status=1
+    done <<< "$ids"
+    return "$status"
+}
+
+remove_image() {
+    local id dependencies cid label
+    local -a dependent_ids=()
+    id="$(podman image inspect --format '{{.Id}}' "$1")" || return
+    id="${id#sha256:}"
+    [[ "$id" =~ ^[a-f0-9]{64}$ ]] || return 1
+    dependencies="$(podman container list --all --no-trunc --filter "ancestor=$id" \
+        --format '{{.ID}}\t{{.Label "toolboxer"}}')" || return
+    while IFS=$'\t' read -r cid label; do
+        [[ -n "$cid" ]] || continue
+        if [[ "$label" != true ]]; then
+            echo "Error: image '$1' is used by non-toolboxer container '$cid'; refusing removal." >&2
+            return 1
+        fi
+        dependent_ids+=("$cid")
+    done <<< "$dependencies"
+    if [[ "$local_force" == true && ${#dependent_ids[@]} -gt 0 ]]; then
+        podman rm --volumes -f "${dependent_ids[@]}" || return
+    fi
+    # No --force here: a concurrent new dependent must prevent image removal.
+    podman rmi --no-prune "$id" || return
+    rm -f -- "$(image_state_dir)/$id"
+    printf "Image '%s' removed.\n" "$1"
+}
 
 cmd="${1:-}"
 if [[ -z "$cmd" ]]; then
@@ -1160,20 +1959,23 @@ case "$cmd" in
         # Parse create-specific flags
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--distro)      DISTRO="$2";  cli_distro_set=true;  shift 2 ;;
+                -d|--distro)      set_distro "$2"; cli_distro_set=true; shift 2 ;;
                 -i|--image)       IMAGE="$2";   cli_image_set=true;   shift 2 ;;
                 -r|--release)     RELEASE="$2"; cli_release_set=true; shift 2 ;;
                 -m|--mount)       cli_mounts+=("$2");   shift 2 ;;
                 -A|--ai-agents)   cli_ai_agents=true;   shift ;;
+                --agent)         cli_agents+=("$2"); cli_ai_agents=true; shift 2 ;;
                 --no-ai-agents)   cli_ai_agents=false;  shift ;;
                 --authfile)       AUTHFILE="$2"; shift 2 ;;
+                --pull)           PULL="$2"; shift 2 ;;
                 --privileged)     cli_privileged=true;  shift ;;
                 --no-privileged)  cli_privileged=false; shift ;;
                 --isolated)       cli_isolated=true;    shift ;;
                 --no-isolated)    cli_isolated=false;   shift ;;
                 -h|--help)        usage_create 0 ;;
-                -*)               echo "Unknown create option: $1"; usage_create ;;
-                *)                CONTAINER_NAME="$1"; shift ;;
+                --)               shift ;;
+                -*)               echo "Unknown create option: $1" >&2; usage_create ;;
+                *)                set_container_arg "$1"; shift ;;
             esac
         done
 
@@ -1188,7 +1990,7 @@ case "$cmd" in
 
         # --image is incompatible with --distro/--release
         if [[ -n "$IMAGE" && ( -n "$DISTRO" || -n "$RELEASE" ) ]]; then
-            echo "Error: --image is incompatible with --distro and --release"
+            echo "Error: --image is incompatible with --distro and --release" >&2
             exit 1
         fi
 
@@ -1198,18 +2000,22 @@ case "$cmd" in
         resolve_mount_dirs
 
         finalize_names
+        warn_host_subids
+        require_rootless
 
         if ensure_exists; then
-            echo "Error: Container '$CONTAINER_NAME' already exists."
-            echo "Remove it first with: $prog rm"
+            echo "Error: Container '$CONTAINER_NAME' already exists." >&2
+            echo "Remove it first with: $prog rm $CONTAINER_NAME" >&2
             exit 1
         fi
 
         mount_display=()
         for spec in "${MOUNT_SPECS[@]}"; do mount_display+=("$(format_mount "$spec")"); done
-        echo "Creating restricted toolbox '$CONTAINER_NAME'"
-        echo "Image: $IMAGE"
-        echo "Mounting: ${mount_display[*]}"
+        # Progress and result messages go to stderr so stdout carries only the
+        # container ID, letting `id=$(toolboxer create ...)` capture it cleanly.
+        echo "Creating toolboxer container '$CONTAINER_NAME'" >&2
+        echo "Image: $IMAGE" >&2
+        echo "Mounting: ${mount_display[*]}" >&2
 
         # Assemble the create flags by mode.
         #
@@ -1217,36 +2023,54 @@ case "$cmd" in
         #   full host integration, host namespaces. --privileged additionally
         #   grants a nested rootless podman the caps it needs (sethostname,
         #   mounting /proc); see README.
-        # --isolated: a hardened sandbox — SELinux-confined (no label=disable),
-        #   private namespaces, no host integration, and the mounts relabeled
-        #   with :z so the confined container can use them.
+        # --isolated: private namespaces and no automatic host-service mounts.
+        # Request SELinux confinement/relabeling only on SELinux-enabled hosts.
         relabel=""
         sec_args=()
         ns_args=()
         host_args=()
         env_args=()
+        runtime_dir=""
         if [[ "$isolated" == true ]]; then
-            relabel="z"
+            ns_args=(--network private --ipc private --pid private --uts private --init)
+            sec_args=(--privileged=false)
+            if [[ "$PODMAN_SELINUX" == true ]]; then
+                relabel="z"
+                sec_args+=(--security-opt label=type:container_t)
+                echo 'Isolation: private namespaces, SELinux confinement requested' >&2
+                # :z is a host-side effect, not a container-only flag: Podman
+                # recursively relabels each shared tree and fails on any file the
+                # user does not own. Surface that instead of relabeling live
+                # credentials silently.
+                echo 'Warning: SELinux relabels every shared directory on the host (:z), changing its label for other tools and requiring you to own every file in it.' >&2
+                [[ "$copy_ai_agents" == true ]] && echo 'Warning: that relabel also applies to the shared --agent credential directories.' >&2
+            else
+                echo 'Isolation: private namespaces (SELinux is not enabled on this host)' >&2
+            fi
             [[ -n "${TERM:-}" ]] && env_args+=(--env "TERM=$TERM")
             [[ -n "${LANG:-}" ]] && env_args+=(--env "LANG=$LANG")
-            echo "Isolation: confined (SELinux, private namespaces, no host integration)"
         else
-            sec_args=(--security-opt label=disable)
+            sec_args=(--privileged=false --security-opt label=disable)
             [[ "$privileged" == true ]] && sec_args+=(--privileged)
             ns_args=(--network host --ipc host --pid host)
-            mapfile -t host_args < <(build_host_integration_args)
-            mapfile -t env_args < <(build_env_args)
+            collect_args build_host_integration_args
+            host_args=("${BUILT_ARGS[@]}")
+            runtime_dir="$(resolved_runtime_dir)" || exit
+            collect_args build_env_args
+            env_args=("${BUILT_ARGS[@]}")
         fi
-        mapfile -t vol_args < <(build_volume_args "$relabel")
+        collect_args build_volume_args "$relabel"
+        vol_args=("${BUILT_ARGS[@]}")
 
         agent_args=()
         if [[ "$copy_ai_agents" == true ]]; then
-            mapfile -t agent_args < <(build_ai_agent_args "$relabel")
+            collect_args build_ai_agent_args "$relabel"
+            agent_args=("${BUILT_ARGS[@]}")
             found_paths="$(found_ai_agents)"
             if [[ -n "$found_paths" ]]; then
-                echo "AI agent config: $found_paths"
+                echo "AI agent config: $found_paths" >&2
             else
-                echo "AI agent config: none found in $HOME"
+                echo "AI agent config: none found in $HOME" >&2
             fi
         fi
 
@@ -1254,12 +2078,32 @@ case "$cmd" in
         authfile_args=()
         [[ -n "$AUTHFILE" ]] && authfile_args=(--authfile "$AUTHFILE")
 
-        # Pull explicitly so a tag the registry doesn't publish (e.g. a point
-        # release like rocky:8.10) fails here with a clear reason instead of a raw
-        # podman error mid-create — and is never silently swapped for another
-        # version. Skipped when the image is already present locally.
-        if ! podman image exists "$IMAGE"; then
-            if ! podman pull "${authfile_args[@]}" "$IMAGE"; then
+        # Pull policy. 'missing' (default) keeps the prior behaviour: pull only
+        # when the image is absent. 'always'/'newer' re-check the source
+        # registry (how to refresh image storage relocated from another host,
+        # though Podman may still reuse matching local blobs); 'never' uses only
+        # what is present. A tag is never substituted for another.
+        case "$PULL" in
+            missing|always|newer|never) ;;
+            *) echo "Error: invalid --pull '$PULL' (use missing, always, newer, or never)." >&2; exit 2 ;;
+        esac
+        pull_needed=false
+        case "$PULL" in
+            never)
+                if ! podman image exists "$IMAGE"; then
+                    echo "Error: image '$IMAGE' is not present and --pull=never was set." >&2
+                    exit 1
+                fi ;;
+            missing) podman image exists "$IMAGE" || pull_needed=true ;;
+            always|newer) pull_needed=true ;;
+        esac
+        if [[ "$pull_needed" == true ]]; then
+            pull_args=("${authfile_args[@]}")
+            [[ "$PULL" == missing ]] || pull_args+=(--policy "$PULL")
+            # Podman prints the pulled image ID to stdout; keep create's stdout
+            # to just the container ID by sending the pull's stdout to stderr.
+            # Progress already goes to stderr, and the exit status is preserved.
+            if ! podman pull "${pull_args[@]}" "$IMAGE" >&2; then
                 echo "" >&2
                 echo "Error: could not pull '$IMAGE'." >&2
                 echo "That image or tag may not exist. Some distros publish only major-version" >&2
@@ -1273,11 +2117,37 @@ case "$cmd" in
         # it otherwise owns the host account, so setup's usermod fails ("currently
         # used by process") and a colliding stock user (ubuntu:1000) never gets
         # renamed. run/enter still exec as the host user.
-        podman create -it \
+        # Plain keep-id maps the actual host UID/GID unchanged, including IDs
+        # other than 1000. Redundant uid=/gid= overrides need newer Podman.
+        group_args=()
+        if [[ "$PODMAN_RUNTIME" == crun ]]; then
+            group_args=(--group-add keep-groups)
+        elif [[ "$(id -G)" == *' '* ]]; then
+            echo 'Warning: supplementary host groups require the crun runtime.' >&2
+        fi
+        mode=integrated
+        [[ "$isolated" == true ]] && mode=isolated
+        [[ "$privileged" == true ]] && mode=privileged
+        expected_binds=""
+        for spec in "${vol_args[@]}" "${agent_args[@]}"; do
+            [[ "$spec" == --volume ]] && continue
+            expected_binds+="${spec%:z}"$'\n'
+        done
+        # Enforce 'never' on the create itself, not just the earlier existence
+        # check: with Podman's default policy the create could still pull if the
+        # image (or a moving tag) changed between the check and creation.
+        # missing/always/newer were already resolved by the pull step above, so
+        # the create keeps Podman's default for them.
+        create_pull_args=()
+        [[ "$PULL" != never ]] || create_pull_args=(--pull=never)
+        created_id="$(podman create -it \
             --name "$CONTAINER_NAME" \
-            --userns=keep-id \
             --user root \
+            --entrypoint sleep \
+            "${create_pull_args[@]}" \
+            "${group_args[@]}" \
             "${sec_args[@]}" \
+            --userns=keep-id \
             --hostname toolboxer \
             --add-host toolboxer:127.0.0.1 \
             "${ns_args[@]}" \
@@ -1287,28 +2157,62 @@ case "$cmd" in
             "${agent_args[@]}" \
             "${authfile_args[@]}" \
             --workdir "$(default_workdir)" \
-            --label "toolbox=true" \
             --label "toolboxer=true" \
+            --label "com.github.containers.toolbox=false" \
+            --label "com.github.debarshiray.toolbox=false" \
+            --label "toolboxer.mode=$mode" \
+            --label "toolboxer.agents=$copy_ai_agents" \
+            --label "toolboxer.agent-names=$AGENT_SELECTION" \
+            --label "toolboxer.binds=$expected_binds" \
+            --label "toolboxer.runtime-dir=$runtime_dir" \
             "$IMAGE" \
-            sleep infinity
+            infinity)"
+        [[ "$created_id" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "Error: Podman returned an unexpected ID for '$CONTAINER_NAME': ${created_id:-(empty)}" >&2
+            echo "The container may exist; inspect it with: podman ps -a --filter name=$CONTAINER_NAME" >&2
+            exit 1
+        }
+        # The container exists now (podman create above), so from here any
+        # failure, interrupt, or a stdout reader that has gone away must take
+        # it with it or the next create trips over the name. Arm cleanup
+        # before the first write: publishing the ID to a closed pipe would
+        # otherwise die of SIGPIPE and leak the container. The wrapper itself
+        # owns the traps, so a signal sent to this process alone still cleans
+        # up; a child-only trap would let the wrapper die while the child
+        # finished and disarmed. Turning the signals into an exit runs the
+        # EXIT trap that a bare signal death would skip. A signal during a
+        # podman call is serviced once that call returns, so cancellation is
+        # bounded by one step.
+        trap 'discard_created_container "$created_id"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap 'exit 141' PIPE
+        printf '%s\n' "$created_id"
+        validate_container_mode
+        if [[ "$copy_ai_agents" == true ]]; then copy_agent_files; fi
+        remember_image "$IMAGE"
+        trap - INT TERM PIPE EXIT
 
-        echo "Restricted toolbox '$CONTAINER_NAME' created!"
-        echo "Run '$prog enter' to start using it."
+        echo "Toolboxer container '$CONTAINER_NAME' created!" >&2
+        echo "Run '$prog enter' to start using it." >&2
         ;;
 
     enter)
         # Parse enter-specific flags
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--distro)  DISTRO="$2";  shift 2 ;;
-                -r|--release) RELEASE="$2"; shift 2 ;;
+                -d|--distro)  set_distro "$2"; shift 2 ;;
+                -r|--release) RELEASE="$2"; cli_release_set=true; shift 2 ;;
                 -h|--help)    usage_enter 0 ;;
-                -*)           echo "Unknown enter option: $1"; usage_enter ;;
-                *)            CONTAINER_NAME="$1"; shift ;;
+                --)           shift ;;
+                -*)           echo "Unknown enter option: $1" >&2; usage_enter ;;
+                *)            set_container_arg "$1"; shift ;;
             esac
         done
 
         finalize_names
+        warn_host_subids
+        require_rootless
 
         if ! resolve_container; then
             echo "Container '$CONTAINER_NAME' not found."
@@ -1323,6 +2227,7 @@ case "$cmd" in
                 for d in "${cli_mounts[@]}"; do
                     reinvoke_args+=(-m "$d")
                 done
+                for agent in "${cli_agents[@]}"; do reinvoke_args+=(--agent "$agent"); done
                 # Pass each mode explicitly (including the --no-* forms) so the
                 # re-invoked 'create' — which re-reads the config file — cannot
                 # derive a different value than we resolved here.
@@ -1342,16 +2247,19 @@ case "$cmd" in
                 [[ -n "$DISTRO" ]] && reinvoke_args+=(--distro "$DISTRO")
                 [[ -n "$RELEASE" ]] && reinvoke_args+=(--release "$RELEASE")
                 reinvoke_args+=("$CONTAINER_NAME")
-                "$0" "${reinvoke_args[@]}"
+                "$0" "${reinvoke_args[@]}" >&2
             else
                 exit 1
             fi
         fi
 
+        validate_container_mode
         ensure_started
+        workdir="$(container_workdir)"
         exec podman exec -it \
             --user "$(id -u):$(id -g)" \
-            --workdir "$(default_workdir)" \
+            --env "HOME=$HOME" \
+            --workdir "$workdir" \
             "$CONTAINER_NAME" \
             bash -l
         ;;
@@ -1361,29 +2269,37 @@ case "$cmd" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -c|--container) CONTAINER_NAME="$2"; shift 2 ;;
-                -d|--distro)    DISTRO="$2";         shift 2 ;;
-                -r|--release)   RELEASE="$2";        shift 2 ;;
+                -d|--distro)    set_distro "$2";     shift 2 ;;
+                -r|--release)   RELEASE="$2"; cli_release_set=true; shift 2 ;;
                 --preserve-fds) PRESERVE_FDS="$2";   shift 2 ;;
                 -h|--help)      usage_run 0 ;;
                 --)             shift; break ;;
+                -*)             echo "Unknown run option: $1" >&2; exit 2 ;;
                 *)              break ;;
             esac
         done
 
         if [[ $# -eq 0 ]]; then
-            echo "Error: 'run' requires a command."
-            echo "Usage: $prog run <command> [args...]"
+            echo "Error: 'run' requires a command." >&2
+            echo "Usage: $prog run <command> [args...]" >&2
             exit 1
         fi
+        [[ -z "$PRESERVE_FDS" || "$PRESERVE_FDS" =~ ^[0-9]+$ ]] || {
+            echo 'Error: --preserve-fds requires a nonnegative integer.' >&2; exit 2;
+        }
 
         finalize_names
+        warn_host_subids
+        require_rootless
 
         if ! resolve_container; then
-            echo "Error: container '$CONTAINER_NAME' not found."
-            echo "Create one first with: $prog create"
+            echo "Error: container '$CONTAINER_NAME' not found." >&2
+            echo "Create one first with: $prog create" >&2
             exit 1
         fi
+        validate_container_mode
         ensure_started
+        workdir="$(container_workdir)"
         # --preserve-fds (toolbox-compatible): pass N extra inherited fds through.
         pfds_args=()
         [[ -n "$PRESERVE_FDS" ]] && pfds_args=(--preserve-fds "$PRESERVE_FDS")
@@ -1394,122 +2310,144 @@ case "$cmd" in
         [[ -t 0 && -t 1 ]] && run_tty+=(-t)
         podman exec "${run_tty[@]}" \
             --user "$(id -u):$(id -g)" \
-            --workdir "$(default_workdir)" \
+            --env "HOME=$HOME" \
+            --workdir "$workdir" \
             "${pfds_args[@]}" \
             "$CONTAINER_NAME" \
-            "$@"
+            sh -c 'export PATH="$HOME/.local/bin:$PATH"; if [ -n "${BASH_VERSION:-}" ]; then exec -- "$@"; else exec "$@"; fi' sh "$@"
         ;;
 
     list)
-        local_show_containers=true
-        local_show_images=true
+        local_show_containers=false
+        local_show_images=false
+        list_selection=false
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -c|--containers) local_show_images=false;     shift ;;
-                -i|--images)     local_show_containers=false; shift ;;
+                -c|--containers) local_show_containers=true; list_selection=true; shift ;;
+                -i|--images)     local_show_images=true; list_selection=true; shift ;;
                 -h|--help)       usage_list 0 ;;
-                *) echo "Unknown list option: $1"; usage_list ;;
+                *) echo "Unknown list option: $1" >&2; usage_list ;;
             esac
         done
-
+        require_rootless
+        if [[ "$list_selection" == false ]]; then local_show_containers=true; local_show_images=true; fi
+        # A failure listing one section must not hide the other or be reported
+        # as success; keep a non-zero status and surface it after both tables.
+        list_status=0
         if [[ "$local_show_images" == true ]]; then
+            rows="$(list_managed_images)" || list_status=$?
             printf "%-14s %-45s %s\n" "IMAGE ID" "IMAGE NAME" "CREATED"
             while IFS=$'\t' read -r iid iname icreated; do
+                [[ -n "$iid" ]] || continue
                 printf "%-14s %-45s %s\n" "$iid" "$iname" "$icreated"
-            done < <(podman image list --filter "reference=*toolbox*" --sort repository --format "{{.ID}}"$'\t'"{{.Repository}}:{{.Tag}}"$'\t'"{{.Created}}")
+            done <<< "$rows"
             echo
         fi
         if [[ "$local_show_containers" == true ]]; then
+            rows="$(podman container list --all --filter label=toolboxer=true --format '{{.ID}}\t{{.Names}}\t{{.CreatedHuman}}\t{{.Status}}\t{{.Image}}')" || list_status=$?
             printf "%-14s %-25s %-20s %-15s %s\n" "CONTAINER ID" "CONTAINER NAME" "CREATED" "STATUS" "IMAGE NAME"
             while IFS=$'\t' read -r cid cname ccreated cstatus cimage; do
+                [[ -n "$cid" ]] || continue
                 if [[ "$cstatus" == Up* ]] && [[ -t 1 ]]; then
                     printf "\033[32m%-14s %-25s %-20s %-15s %s\033[0m\n" "$cid" "$cname" "$ccreated" "$cstatus" "$cimage"
                 else
                     printf "%-14s %-25s %-20s %-15s %s\n" "$cid" "$cname" "$ccreated" "$cstatus" "$cimage"
                 fi
-            done < <(podman container list --all --filter "label=toolboxer=true" --format "{{.ID}}\t{{.Names}}\t{{.CreatedHuman}}\t{{.Status}}\t{{.Image}}")
+            done <<< "$rows"
         fi
+        [[ "$list_status" -eq 0 ]] || exit "$list_status"
         ;;
 
     stop)
         # Parse stop-specific flags / positional container name
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--distro)  DISTRO="$2";  shift 2 ;;
-                -r|--release) RELEASE="$2"; shift 2 ;;
+                -d|--distro)  set_distro "$2"; shift 2 ;;
+                -r|--release) RELEASE="$2"; cli_release_set=true; shift 2 ;;
                 -h|--help)    usage_stop 0 ;;
-                -*)           echo "Unknown stop option: $1"; usage_stop ;;
-                *)            CONTAINER_NAME="$1"; shift ;;
+                --)           shift ;;
+                -*)           echo "Unknown stop option: $1" >&2; usage_stop ;;
+                *)            set_container_arg "$1"; shift ;;
             esac
         done
 
         finalize_names
+        require_rootless
 
         if ! resolve_container; then
-            echo "Error: Container '$CONTAINER_NAME' does not exist."
+            echo "Error: Container '$CONTAINER_NAME' does not exist." >&2
             exit 1
         fi
+        require_managed_container
         podman stop "$CONTAINER_NAME" && echo "Container '$CONTAINER_NAME' stopped."
         ;;
 
     rm)
         local_all=false
         local_force=false
+        explicit_target=false
         local_containers=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -a|--all)     local_all=true;             shift ;;
-                -f|--force)   local_force=true;           shift ;;
-                -d|--distro)  DISTRO="$2";                shift 2 ;;
-                -r|--release) RELEASE="$2";               shift 2 ;;
-                -h|--help)    usage_rm 0 ;;
-                -*)           echo "Unknown rm option: $1"; usage_rm ;;
-                *)            local_containers+=("$1");   shift ;;
+                -a|--all) local_all=true; shift ;;
+                -f|--force) local_force=true; shift ;;
+                -d|--distro) set_distro "$2"; explicit_target=true; shift 2 ;;
+                -r|--release) RELEASE="$2"; cli_release_set=true; explicit_target=true; shift 2 ;;
+                -h|--help) usage_rm 0 ;;
+                --) shift ;;
+                -*) echo "Unknown rm option: $1" >&2; exit 2 ;;
+                *) local_containers+=("$1"); shift ;;
             esac
         done
-
-        rm_flags=()
-        [[ "$local_force" == true ]] && rm_flags+=(-f)
-
-        if [[ "$local_all" == true ]]; then
-            containers="$(podman container list --all --filter 'label=toolboxer=true' --format '{{.Names}}' 2>/dev/null)"
-            if [[ -z "$containers" ]]; then
-                echo "No toolboxer containers found."
-                exit 0
-            fi
-            while IFS= read -r c; do
-                if podman rm "${rm_flags[@]}" "$c" >/dev/null 2>&1; then
-                    echo "Container '$c' removed."
-                else
-                    echo "Error: Could not remove '$c' (is it running? use --force)"
-                fi
-            done <<< "$containers"
-        else
-            # No names: resolve a target only if one was actually specified
-            # (-d/-r, or an env/config default). A bare 'rm' is an error, like
-            # toolbox — it never removes a container you didn't name, and (unlike
-            # enter/run/stop) it does not fall back to the only container.
-            if [[ ${#local_containers[@]} -eq 0 ]]; then
-                finalize_names
-                if [[ "$container_pinned" != true ]]; then
-                    echo "Error: missing argument for 'rm' — name a container, or use --all."
-                    echo "Run '$prog rm --help' for usage."
-                    exit 1
-                fi
-                local_containers=("$CONTAINER_NAME")
-            fi
-            for cname in "${local_containers[@]}"; do
-                if podman rm "${rm_flags[@]}" "$cname" >/dev/null 2>&1; then
-                    echo "Container '$cname' removed."
-                else
-                    if podman container exists "$cname"; then
-                        echo "Error: Could not remove '$cname' (is it running? use --force)"
-                    else
-                        echo "Container '$cname' not found."
-                    fi
-                fi
-            done
+        if [[ "$local_all" == true && ( ${#local_containers[@]} -gt 0 || "$explicit_target" == true ) ]]; then
+            echo 'Error: --all cannot be combined with container names or distro/release selectors.' >&2; exit 2
         fi
+        if [[ "$local_all" == false && ${#local_containers[@]} -eq 0 ]]; then
+            [[ "$explicit_target" == true ]] || {
+                echo "Error: missing argument for 'rm' — name a container, or use --all." >&2; exit 2;
+            }
+            finalize_names
+            local_containers=("$CONTAINER_NAME")
+        fi
+        require_rootless
+        if [[ "$local_all" == true ]]; then
+            containers="$(podman container list --all --filter label=toolboxer=true --format '{{.Names}}')"
+            if [[ -z "$containers" ]]; then echo 'No toolboxer containers found.'; exit 0; fi
+            mapfile -t local_containers <<< "$containers"
+        fi
+        rm_flags=(--volumes)
+        [[ "$local_force" == true ]] && rm_flags+=(-f)
+        status=0
+        for cname in "${local_containers[@]}"; do
+            if ! podman container exists "$cname"; then
+                echo "Container '$cname' not found or unavailable." >&2; status=1; continue
+            fi
+            if ! label="$(podman inspect --format '{{index .Config.Labels "toolboxer"}}' "$cname")"; then
+                status=1; continue
+            fi
+            if [[ "$label" != true ]]; then
+                echo "Error: '$cname' is not a toolboxer container." >&2; status=1; continue
+            fi
+            if ! image_id="$(podman inspect --format '{{.Image}}' "$cname")"; then
+                status=1; continue
+            fi
+            # Recording the image lets a later `rmi`/`rm -i` find it, but this
+            # bookkeeping must never block the removal the user asked for: a
+            # container whose image was already deleted (forced rmi, storage GC)
+            # still has to be removable. Warn and remove anyway; the exit status
+            # reflects `podman rm`, not the tracking. A failed container inspect
+            # above is different: it means the container's own state is unknown,
+            # so that case still skips (see the multi-target regression).
+            if ! remember_image "$image_id"; then
+                echo "Warning: could not record image for '$cname'; removing it anyway." >&2
+            fi
+            if podman rm "${rm_flags[@]}" "$cname"; then
+                echo "Container '$cname' removed."
+            else
+                echo "Error: could not remove '$cname'." >&2; status=1
+            fi
+        done
+        exit "$status"
         ;;
 
     rmi)
@@ -1521,47 +2459,31 @@ case "$cmd" in
                 -a|--all)   local_all=true;          shift ;;
                 -f|--force) local_force=true;         shift ;;
                 -h|--help)  usage_rmi 0 ;;
-                -*)         echo "Unknown rmi option: $1"; usage_rmi ;;
+                -*)         echo "Unknown rmi option: $1" >&2; usage_rmi ;;
                 *)          local_images+=("$1");     shift ;;
             esac
         done
 
-        rmi_flags=()
-        [[ "$local_force" == true ]] && rmi_flags+=(-f)
-
-        if [[ "$local_all" == true ]]; then
-            images="$(podman image list --filter 'reference=*toolbox*' --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)"
-            if [[ -z "$images" ]]; then
-                echo "No toolbox images found."
-                exit 0
-            fi
-            while IFS= read -r img; do
-                if [[ "$local_force" == true ]]; then
-                    deps="$(podman container list --all --filter "ancestor=$img" --filter 'label=toolboxer=true' --format '{{.Names}}' 2>/dev/null)"
-                    if [[ -n "$deps" ]]; then
-                        while IFS= read -r c; do
-                            podman rm -f "$c" >/dev/null 2>&1 && echo "Container '$c' removed."
-                        done <<< "$deps"
-                    fi
-                fi
-                if podman rmi "${rmi_flags[@]}" "$img" >/dev/null 2>&1; then
-                    echo "Image '$img' removed."
-                else
-                    echo "Error: Could not remove image '$img'"
-                fi
-            done <<< "$images"
-        elif [[ ${#local_images[@]} -gt 0 ]]; then
-            for img in "${local_images[@]}"; do
-                if podman rmi "${rmi_flags[@]}" "$img" >/dev/null 2>&1; then
-                    echo "Image '$img' removed."
-                else
-                    echo "Error: Could not remove image '$img'"
-                fi
-            done
-        else
-            echo "Error: Specify image name(s) or use --all"
-            exit 1
+        if [[ "$local_all" == true && ${#local_images[@]} -gt 0 ]]; then
+            echo 'Error: --all cannot be combined with image names.' >&2; exit 2
         fi
+        if [[ "$local_all" == false && ${#local_images[@]} -eq 0 ]]; then
+            echo 'Error: specify image names or --all.' >&2; exit 2
+        fi
+        require_rootless
+        if [[ "$local_all" == true ]]; then
+            images="$(managed_image_ids)"
+            if [[ -z "$images" ]]; then echo 'No toolboxer images found.'; exit 0; fi
+            mapfile -t local_images <<< "$images"
+        fi
+        status=0
+        for img in "${local_images[@]}"; do
+            if ! remove_image "$img"; then
+                echo "Error: could not remove image '$img'." >&2
+                status=1
+            fi
+        done
+        exit "$status"
         ;;
 
     config)
@@ -1571,8 +2493,8 @@ case "$cmd" in
         while [[ $# -gt 0 ]]; do
             case "$1" in
                 -h|--help)    usage_config 0 ;;
-                -*)           echo "Unknown config option: $1"; usage_config ;;
-                *)            echo "Unknown config argument: $1"; usage_config ;;
+                -*)           echo "Unknown config option: $1" >&2; usage_config ;;
+                *)            echo "Unknown config argument: $1" >&2; usage_config ;;
             esac
         done
 
@@ -1588,22 +2510,16 @@ case "$cmd" in
         echo "Effective settings (config file < env vars < CLI flags):"
         printf '  %-11s %s\n' "mount"      "${mount_display[*]}"
         printf '  %-11s %s\n' "ai_agents"  "$copy_ai_agents"
+        printf '  %-11s %s\n' "agents"     "$AGENT_SELECTION"
         printf '  %-11s %s\n' "assumeyes"  "$assume_yes"
         printf '  %-11s %s\n' "privileged" "$privileged"
         printf '  %-11s %s\n' "isolated"   "$isolated"
         printf '  %-11s %s\n' "image"      "$IMAGE"
         printf '  %-11s %s\n' "container"  "$CONTAINER_NAME"
-        if [[ -n "$DISTRO" ]]; then
-            printf '  %-11s %s\n' "distro"  "$DISTRO"
-        else
-            printf '  %-11s %s\n' "distro"  "$HOST_ID (host default)"
-        fi
-        if [[ -n "$RELEASE" ]]; then
-            printf '  %-11s %s\n' "release" "$RELEASE"
-        else
-            printf '  %-11s %s\n' "release" "$HOST_VERSION_ID (host default)"
-        fi
+        printf '  %-11s %s\n' "distro" "$EFFECTIVE_DISTRO"
+        printf '  %-11s %s\n' "release" "$EFFECTIVE_RELEASE"
         printf '  %-11s %s\n' "authfile"   "${AUTHFILE:-(none)}"
+        printf '  %-11s %s\n' "pull"       "$PULL"
         if [[ -f "$PROVISION_SCRIPT" ]]; then
             printf '  %-11s %s\n' "provision" "$PROVISION_SCRIPT"
         else
@@ -1615,30 +2531,37 @@ case "$cmd" in
         # On-demand re-run; first start provisions automatically (see usage_provision).
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                -d|--distro)  DISTRO="$2";  shift 2 ;;
-                -r|--release) RELEASE="$2"; shift 2 ;;
+                -d|--distro)  set_distro "$2"; shift 2 ;;
+                -r|--release) RELEASE="$2"; cli_release_set=true; shift 2 ;;
                 -h|--help)    usage_provision 0 ;;
-                -*)           echo "Unknown provision option: $1"; usage_provision ;;
-                *)            CONTAINER_NAME="$1"; shift ;;
+                --)           shift ;;
+                -*)           echo "Unknown provision option: $1" >&2; usage_provision ;;
+                *)            set_container_arg "$1"; shift ;;
             esac
         done
 
         finalize_names
+        warn_host_subids
+        require_rootless
         if ! resolve_container; then
-            echo "Error: container '$CONTAINER_NAME' not found."
-            echo "Create one first with: $prog create"
+            echo "Error: container '$CONTAINER_NAME' not found." >&2
+            echo "Create one first with: $prog create" >&2
             exit 1
         fi
-        ensure_started
-        run_provision "$CONTAINER_NAME" required
+        validate_container_mode
+        ensure_started explicit
         ;;
 
     help)
-        usage 0
+        case "${1:-}" in
+            "") usage 0 ;;
+            create|enter|run|list|rm|rmi|stop|config|provision) "usage_$1" 0 ;;
+            *) echo "Error: unknown help topic '$1'." >&2; exit 2 ;;
+        esac
         ;;
 
     *)
-        echo "Unknown command: $cmd"
+        echo "Unknown command: $cmd" >&2
         usage
         ;;
 esac
